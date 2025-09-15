@@ -1,10 +1,16 @@
+// server.mjs
+// SERPAVI scraper HTTP (Express + Playwright)
+// - POST /  { rc, ascensor, planta, estado, etiqueta, aparcamiento?, amueblado?, dormitorios?, banos?, exterior?, m2?, dir?, prov?, muni?, antiguedad? }
+// - GET  /health
+// Devuelve: { ok:true, min, max, precio_ref }  (o { ok:false, error })
+
 import express from "express";
 import { chromium } from "playwright";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// --- CORS simple (sin dependencias)
+// --- CORS básico
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -24,11 +30,11 @@ const toNum = (s) => {
 function extractRangeAndRef(raw) {
   const t = String(raw || "").replace(/\s+/g, " ");
 
-  // Precio referencia (varias formas de escribirlo)
+  // Precio referencia
   const refPatterns = [
-    /precio\s+de\s+referencia[^0-9€]*([\d\.\,]+)/i,
-    /precio\s+referencia[^0-9€]*([\d\.\,]+)/i,
-    /precio\s+máximo\s+de\s+referencia[^0-9€]*([\d\.\,]+)/i,
+    /precio\s+de\s+referencia[^\d\u20AC]*([\d\.\,]+)/i,
+    /precio\s+referencia[^\d\u20AC]*([\d\.\,]+)/i,
+    /precio\s+m[aá]ximo\s+de\s+referencia[^\d\u20AC]*([\d\.\,]+)/i,
   ];
   let precio_ref = null;
   for (const rx of refPatterns) {
@@ -38,9 +44,9 @@ function extractRangeAndRef(raw) {
 
   // Rango (900 – 1.100 €, 900-1100 €, etc.)
   const rangePatterns = [
-    /rango[^0-9€]*([\d\.\,]+)\D+([\d\.\,]+)/i,
-    /entre[^0-9€]*([\d\.\,]+)\D+([\d\.\,]+)\s*(?:€|eur)?/i,
-    /mínimo[^0-9€]*([\d\.\,]+)[^\d]+máximo[^0-9€]*([\d\.\,]+)/i,
+    /rango[^\d\u20AC]*([\d\.\,]+)\D+([\d\.\,]+)/i,
+    /entre[^\d\u20AC]*([\d\.\,]+)\D+([\d\.\,]+)\s*(?:\u20AC|eur)?/i,
+    /m[ií]nimo[^\d\u20AC]*([\d\.\,]+)[^\d]+m[aá]ximo[^\d\u20AC]*([\d\.\,]+)/i,
   ];
   let min = null, max = null;
   for (const rx of rangePatterns) {
@@ -82,7 +88,7 @@ async function fillRC(page, rc) {
   const tabRC = page.getByRole("tab", { name: /referencia\s+catastral/i }).first();
   if (await tabRC.count()) await tabRC.click().catch(()=>{});
 
-  // Campos típicos
+  // Inputs típicos
   const inputs = [
     'input[placeholder*="catastral" i]',
     'input[name*="catastral" i]',
@@ -92,7 +98,7 @@ async function fillRC(page, rc) {
     const el = page.locator(sel).first();
     if (await el.count()) { await el.fill(rc); return true; }
   }
-  // Fallback: primer textbox
+  // Fallback
   const any = page.getByRole("textbox").first();
   if (await any.count()) { await any.fill(rc); return true; }
   return false;
@@ -113,7 +119,7 @@ async function setRadioYesNo(page, groupRegex, yes) {
   if (yes == null) return;
   const group = page.getByRole("group", { name: groupRegex }).first();
   if (!(await group.count())) return;
-  const target = group.getByRole("radio", { name: yes ? /sí|si|yes/i : /no/i }).first();
+  const target = group.getByRole("radio", { name: yes ? /s[ií]|yes/i : /no/i }).first();
   if (await target.count()) await target.check().catch(()=>{});
 }
 
@@ -134,7 +140,7 @@ app.post("/", async (req, res) => {
   try {
     const {
       rc,
-      // atributos no deducibles (obligatorios para exactitud)
+      // obligatorios para exactitud
       ascensor, planta, estado, etiqueta,
       // opcionales
       aparcamiento, amueblado, dormitorios, banos, exterior,
@@ -146,7 +152,6 @@ app.post("/", async (req, res) => {
       return res.status(400).json({ ok:false, error:"RC inválida (debe tener 20 caracteres alfanuméricos)" });
     }
 
-    // Validación mínima recomendada por SERPAVI
     const required = { ascensor, planta, estado, etiqueta };
     const missing = Object.entries(required)
       .filter(([_,v]) => v===undefined || v===null || v==="")
@@ -155,7 +160,7 @@ app.post("/", async (req, res) => {
       return res.status(200).json({ ok:true, needs: missing, hint: "Faltan atributos para completar el cálculo en SERPAVI" });
     }
 
-    // Lanzar navegador (parámetros seguros para PaaS)
+    // Navegador (flags seguros para PaaS)
     const browser = await chromium.launch({
       headless: true,
       args: ["--no-sandbox", "--disable-setuid-sandbox"]
@@ -167,7 +172,7 @@ app.post("/", async (req, res) => {
     const page = await ctx.newPage();
 
     try {
-      // 1) Ir a SERPAVI
+      // 1) SERPAVI
       await page.goto("https://serpavi.mivau.gob.es/", { waitUntil: "domcontentloaded", timeout: 60000 });
       await acceptCookiesIfAny(page);
 
@@ -177,27 +182,24 @@ app.post("/", async (req, res) => {
         'text=/Iniciar|Acceder|Consultar/i'
       ]);
 
-      // 3) Elegir búsqueda por RC y rellenar
+      // 3) RC
       await fillRC(page, String(rc));
 
-      // 4) Completar atributos (si aparecen)
+      // 4) Atributos (si aparecen)
       await setSelectOrInput(page, /planta/i, planta);
       await setSelectOrInput(page, /estado/i, estado);
-      // etiqueta A..G
       const et = String(etiqueta || "").trim().toUpperCase();
       if (["A","B","C","D","E","F","G"].includes(et)) {
         await setSelectOrInput(page, /etiqueta/i, et);
       }
-
       await setRadioYesNo(page, /ascensor/i, !!ascensor);
       await setRadioYesNo(page, /(aparcamiento|parking)/i, !!aparcamiento);
       await setRadioYesNo(page, /amueblado/i, !!amueblado);
       await setRadioYesNo(page, /exterior/i, !!exterior);
-
       if (dormitorios != null) await setSelectOrInput(page, /dormitorios|habitaciones/i, dormitorios);
       if (banos != null)       await setSelectOrInput(page, /ba(ñ|n)os/i, banos);
 
-      // 5) Lanzar búsqueda/cálculo
+      // 5) Calcular
       await tryClick(page, [
         'role=button[name=/buscar|calcular|continuar|siguiente/i]',
         'text=/Buscar|Calcular|Continuar|Siguiente/i'
@@ -234,11 +236,3 @@ app.post("/", async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("SERPAVI scraper listening on", PORT));
-
-
-
-
-
-Fuentes
-
-Preguntar a ChatGPT
