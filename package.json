@@ -1,0 +1,12 @@
+{
+  "name": "serpavi-scraper",
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "postinstall": "npx playwright install --with-deps"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "playwright": "^1.47.0"
+  }
+}
