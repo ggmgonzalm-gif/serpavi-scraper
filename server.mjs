@@ -8,6 +8,14 @@ import express from "express";
 import { chromium } from "playwright";
 
 const app = express();
+
+// --- timeouts para que no “cuelgue” al cliente
+app.use((req, res, next) => {
+  req.setTimeout?.(65000);
+  res.setTimeout?.(65000);
+  next();
+});
+
 app.use(express.json({ limit: "1mb" }));
 
 // --- CORS básico
@@ -25,23 +33,20 @@ function eurToNum(s) {
   const v = Number(String(s).replace(/\./g, "").replace(",", "."));
   return Number.isFinite(v) ? v : null;
 }
-function sanitizeRange({ min, max, precio_ref }, text) {
-  // Intercambia si vienen cruzados (p.ej. min=4213, max=30)
-  if (min != null && max != null && min > max) [min, max] = [max, min];
 
-  // Plausibilidad (€/mes)
+function sanitizeRange({ min, max, precio_ref }, text) {
+  if (min != null && max != null && min > max) [min, max] = [max, min];
   const plausible = (x) => x != null && x >= 100 && x <= 20000;
   if (min != null && !plausible(min)) min = null;
   if (max != null && !plausible(max)) max = null;
 
-  // Si hay “Precio de referencia” explícito, úsalo
   if (precio_ref == null && text && /precio\s+de\s+referencia/i.test(text)) {
     const m = text.match(/precio\s+de\s+referencia[^\d\u20AC]*([\d\.\,]+)/i);
     if (m) precio_ref = eurToNum(m[1]);
   }
-
   return { min, max, precio_ref };
 }
+
 // Busca TODOS los importes con € y escoge un rango coherente
 function pickRangeFromText(text) {
   const nums = [];
@@ -52,13 +57,13 @@ function pickRangeFromText(text) {
     if (v != null) nums.push(v);
   }
   nums.sort((a,b)=>a-b);
-  // candidatos plausibles y separados razonablemente
   for (let i=0;i<nums.length-1;i++){
     const a=nums[i], b=nums[i+1];
     if (a>=100 && b>=100 && b-a>=10) return { min:a, max:b };
   }
   return { min: nums[0] ?? null, max: nums[1] ?? null };
 }
+
 // Extrae precios desde texto visible (varias variantes de SERPAVI)
 function extractRangeAndRef(raw) {
   const t = String(raw || "").replace(/\s+/g, " ");
@@ -97,8 +102,7 @@ function extractRangeAndRef(raw) {
     const fb = pickRangeFromText(t);
     out = sanitizeRange({ ...out, ...fb }, t);
   }
-
-  return out; // { min, max, precio_ref }
+  return out;
 }
 
 // ---------- Playwright helpers ----------
@@ -118,6 +122,7 @@ async function acceptCookiesIfAny(page) {
     } catch {}
   }
 }
+
 async function tryClick(page, selectors) {
   for (const sel of selectors) {
     const el = page.locator(sel).first();
@@ -128,8 +133,8 @@ async function tryClick(page, selectors) {
   }
   return false;
 }
+
 async function fillRC(page, rc) {
-  // Pestaña "Referencia catastral"
   const tabRC = page.getByRole("tab", { name: /referencia\s+catastral/i }).first();
   if (await tabRC.count()) await tabRC.click().catch(()=>{});
 
@@ -147,6 +152,7 @@ async function fillRC(page, rc) {
   if (await any.count()) { await any.fill(rc); return true; }
   return false;
 }
+
 async function setSelectOrInput(page, labelRegex, value) {
   if (value == null || value === "") return;
   const sel = page.getByLabel(labelRegex, { exact: false }).first();
@@ -157,6 +163,7 @@ async function setSelectOrInput(page, labelRegex, value) {
     else await sel.fill(String(value));
   } catch {}
 }
+
 async function setRadioYesNo(page, groupRegex, yes) {
   if (yes == null) return;
   const group = page.getByRole("group", { name: groupRegex }).first();
@@ -167,12 +174,10 @@ async function setRadioYesNo(page, groupRegex, yes) {
 
 async function reachSerpaviApp(ctx) {
   let page = await ctx.newPage();
-  // 1) Intento directo
-  await page.goto("https://serpavi.mivau.gob.es/", { waitUntil: "domcontentloaded", timeout: 60000 }).catch(()=>{});
+  await page.goto("https://serpavi.mivau.gob.es/", { waitUntil: "domcontentloaded", timeout: 15000 }).catch(()=>{});
   await acceptCookiesIfAny(page).catch(()=>{});
   try { if (new URL(page.url()).hostname === "serpavi.mivau.gob.es") return page; } catch {}
-  // 2) Fallback: página informativa y salto a la app
-  await page.goto("https://www.mivau.gob.es/vivienda/alquila-bien-es-tu-derecho/serpavi", { waitUntil: "domcontentloaded", timeout: 60000 }).catch(()=>{});
+  await page.goto("https://www.mivau.gob.es/vivienda/alquila-bien-es-tu-derecho/serpavi", { waitUntil: "domcontentloaded", timeout: 15000 }).catch(()=>{});
   await acceptCookiesIfAny(page).catch(()=>{});
   const candidates = [
     'a[href*="serpavi.mivau.gob.es"]',
@@ -194,8 +199,7 @@ async function reachSerpaviApp(ctx) {
       }
     }
   }
-  // 3) Último intento directo
-  await page.goto("https://serpavi.mivau.gob.es/", { waitUntil: "domcontentloaded", timeout: 60000 }).catch(()=>{});
+  await page.goto("https://serpavi.mivau.gob.es/", { waitUntil: "domcontentloaded", timeout: 15000 }).catch(()=>{});
   await acceptCookiesIfAny(page).catch(()=>{});
   return page;
 }
@@ -204,6 +208,7 @@ async function reachSerpaviApp(ctx) {
 app.get("/health", (req, res) => {
   res.json({ ok: true, ts: new Date().toISOString() });
 });
+
 app.get("/", (req, res) => {
   res.type("text/plain").send(
 `SERPAVI scraper
@@ -216,11 +221,8 @@ app.post("/", async (req, res) => {
   try {
     const {
       rc,
-      // obligatorios para exactitud
       ascensor, planta, estado, etiqueta,
-      // opcionales (no imprescindibles para scraping)
       aparcamiento, amueblado, dormitorios, banos, exterior,
-      m2, dir, prov, muni, antiguedad
     } = req.body || {};
 
     if (!rc || !/^[A-Z0-9]{20}$/.test(String(rc))) {
@@ -228,9 +230,7 @@ app.post("/", async (req, res) => {
     }
 
     const required = { ascensor, planta, estado, etiqueta };
-    const missing = Object.entries(required)
-      .filter(([_,v]) => v===undefined || v===null || v==="")
-      .map(([k])=>k);
+    const missing = Object.entries(required).filter(([_,v]) => v===undefined || v===null || v==="").map(([k])=>k);
     if (missing.length) {
       return res.status(200).json({ ok:true, needs: missing, hint: "Faltan atributos para completar el cálculo en SERPAVI" });
     }
@@ -239,22 +239,42 @@ app.post("/", async (req, res) => {
       headless: true,
       args: ["--no-sandbox", "--disable-setuid-sandbox"]
     });
+
     const ctx = await browser.newContext({
       viewport: { width: 1280, height: 900 },
-      userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
+      userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
+      locale: "es-ES",
+      ignoreHTTPSErrors: true,
     });
-    const page = await reachSerpaviApp(ctx);
-    page.setDefaultTimeout(15000);
-    page.setDefaultNavigationTimeout(20000);
 
+    // Bloquea recursos pesados/analytics para acelerar y evitar cuelgues
+    await ctx.route('**/*', (route) => {
+      const req = route.request();
+      const t = req.resourceType();
+      const url = req.url();
+      if (['image','font','media','stylesheet','websocket'].includes(t)) return route.abort();
+      if (/analytics|googletag|gtm|hotjar|matomo|doubleclick|facebook|cdn-cook/i.test(url)) return route.abort();
+      return route.continue();
+    });
+
+    // ⏱️ Todo el scraping va DENTRO de una carrera con timeout global
     const doWork = (async () => {
-      // Flujo principal
+      // 1) Llegar a la app (timeout propio 15s)
+      const page = await Promise.race([
+        reachSerpaviApp(ctx),
+        new Promise((_, rej) => setTimeout(()=>rej(new Error('SERPAVI_UNREACHABLE')), 15000))
+      ]);
+
+      page.setDefaultTimeout(12000);
+      page.setDefaultNavigationTimeout(15000);
+
+      // 2) Entrar/continuar
       await tryClick(page, [
         'role=button[name=/iniciar|acceder|consultar|buscar|calcular/i]',
         'text=/Iniciar|Acceder|Consultar|Buscar|Calcular/i'
       ]).catch(()=>{});
 
-      // RC
+      // 3) RC
       await fillRC(page, String(rc));
       await tryClick(page, [
         'role=button[name=/buscar|consultar|calcular|continuar|siguiente/i]',
@@ -263,13 +283,11 @@ app.post("/", async (req, res) => {
       const firstInput = page.getByRole("textbox").first();
       if (await firstInput.count()) await firstInput.press("Enter").catch(()=>{});
 
-      // Atributos (si aparecen)
+      // 4) Atributos
       await setSelectOrInput(page, /planta/i, planta);
       await setSelectOrInput(page, /estado/i, estado);
       const et = String(etiqueta || "").trim().toUpperCase();
-      if (["A","B","C","D","E","F","G"].includes(et)) {
-        await setSelectOrInput(page, /etiqueta/i, et);
-      }
+      if (["A","B","C","D","E","F","G"].includes(et)) await setSelectOrInput(page, /etiqueta/i, et);
       await setRadioYesNo(page, /ascensor/i, !!ascensor);
       await setRadioYesNo(page, /(aparcamiento|parking)/i, !!aparcamiento);
       await setRadioYesNo(page, /amueblado/i, !!amueblado);
@@ -277,17 +295,17 @@ app.post("/", async (req, res) => {
       if (dormitorios != null) await setSelectOrInput(page, /dormitorios|habitaciones/i, dormitorios);
       if (banos != null)       await setSelectOrInput(page, /ba(ñ|n)os/i, banos);
 
-      // Calcular
+      // 5) Calcular
       await tryClick(page, [
         'role=button[name=/buscar|calcular|continuar|siguiente/i]',
         'text=/Buscar|Calcular|Continuar|Siguiente/i'
       ]);
 
-      // Esperas
-      await page.waitForTimeout(2500);
-      await page.waitForLoadState("networkidle", { timeout: 20000 }).catch(()=>{});
+      // 6) Esperar resultados
+      await page.waitForTimeout(2000);
+      await page.waitForLoadState("networkidle", { timeout: 12000 }).catch(()=>{});
 
-      // Intentar extraer desde nodos ancla
+      // 7) Extraer importes (anclas + fallback body)
       const anchors = [
         'text=/Precio\\s+de\\s+referencia/i',
         'text=/Rango/i',
@@ -307,41 +325,33 @@ app.post("/", async (req, res) => {
         }
       }
 
-      // Fallback: texto completo del body
       if (min==null && max==null && precio_ref==null) {
         const fullText = await page.evaluate(() => document.body.innerText || "");
         const r = extractRangeAndRef(fullText);
         min = r.min; max = r.max; precio_ref = r.precio_ref;
+
         if (!min && !max && !precio_ref) {
-          const html = await page.content().catch(()=>null);
-          const shot = await page.screenshot({ fullPage: true }).catch(()=>null);
-          return { ok:false,
-            error:"No se pudo extraer el rango. La UI puede haber cambiado.",
-            debug_hint:"Ajusta patrones/seletores en extractRangeAndRef()",
-            sample: fullText.slice(0,2000),
-            html: html ? html.slice(0,2000) : null,
-            screenshot_base64: shot ? Buffer.from(shot).toString("base64") : null
+          return {
+            ok:false,
+            error:"UI_CHANGED",
+            hint:"Ajustar patrones en extractRangeAndRef()",
+            sample: fullText.slice(0,2000)
           };
         }
       }
 
-      // Saneado final
       const out = sanitizeRange({ min, max, precio_ref }, "");
       return { ok:true, min: out.min ?? null, max: out.max ?? null, precio_ref: out.precio_ref ?? null, rc, via:"playwright" };
     })();
 
     const result = await Promise.race([
       doWork,
-      new Promise((_, rej) => setTimeout(()=>rej(new Error("TIMEOUT 45s")), 45000))
+      new Promise((_, rej) => setTimeout(()=>rej(new Error("TIMEOUT_GLOBAL_60s")), 60000))
     ]);
 
-    if (result && result.ok) {
-      return res.json(result);
-    } else if (result && result.ok === false) {
-      return res.status(200).json(result);
-    } else {
-      return res.status(504).json({ ok:false, error:String(result || "timeout") });
-    }
+    if (result && result.ok) return res.json(result);
+    if (result && result.ok === false) return res.status(200).json(result);
+    return res.status(504).json({ ok:false, error:String(result || "timeout") });
 
   } catch (err) {
     return res.status(500).json({ ok:false, error: String(err) });
