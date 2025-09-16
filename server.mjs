@@ -2,7 +2,7 @@
 // SERPAVI scraper HTTP (Express + Playwright)
 // - POST /  { rc, ascensor, planta, estado, etiqueta, aparcamiento?, amueblado?, dormitorios?, banos?, exterior? }
 // - GET  /health
-// - GET  /diag
+// - GET  /diag   (diagnóstico de conectividad)
 // Devuelve: { ok:true, min, max, precio_ref, via:"playwright" }  (o { ok:false, error, ...debug })
 
 import express from "express";
@@ -36,7 +36,6 @@ function eurToNum(s) {
   const v = Number(String(s).replace(/\./g, "").replace(",", "."));
   return Number.isFinite(v) ? v : null;
 }
-
 function sanitizeRange({ min, max, precio_ref }, text) {
   if (min != null && max != null && min > max) [min, max] = [max, min];
   const plausible = (x) => x != null && x >= 100 && x <= 20000;
@@ -49,11 +48,10 @@ function sanitizeRange({ min, max, precio_ref }, text) {
   }
   return { min, max, precio_ref };
 }
-
+// Evita coger “años” sueltos: exigimos símbolo € o literal euros
 function pickRangeFromText(text) {
   const nums = [];
-  // Importes con € / euros (usamos \u20AC para evitar el literal)
-  const rx = /([\d]{2,3}(?:\.\d{3})*(?:,\d{1,2})?)\s*(?:\u20AC|euros?|eur)/gi;
+  const rx = /([\d]{2,3}(?:\.\d{3})*(?:,\d{1,2})?)\s*(?:\u20AC|€|euros?|eur)\b/gi;
   let m;
   while ((m = rx.exec(text)) !== null) {
     const v = eurToNum(m[1]);
@@ -66,15 +64,14 @@ function pickRangeFromText(text) {
   }
   return { min: nums[0] ?? null, max: nums[1] ?? null };
 }
-
 function extractRangeAndRef(raw) {
   const t = String(raw || "").replace(/\s+/g, " ");
 
   const refPatterns = [
-    /precio\s+de\s+referencia[^\d\u20AC]*([\d\.\,]+)/i,
-    /precio\s+referencia[^\d\u20AC]*([\d\.\,]+)/i,
-    /precio\s+m[aá]ximo\s+de\s+referencia[^\d\u20AC]*([\d\.\,]+)/i,
-    /referencia:\s*([\d\.\,]+)\s*(?:\u20AC|euros?)/i,
+    /precio\s+de\s+referencia[^\d\u20AC€]*([\d\.\,]+)/i,
+    /precio\s+referencia[^\d\u20AC€]*([\d\.\,]+)/i,
+    /precio\s+m[aá]ximo\s+de\s+referencia[^\d\u20AC€]*([\d\.\,]+)/i,
+    /referencia:\s*([\d\.\,]+)\s*(?:\u20AC|€|euros?)/i,
   ];
   let precio_ref = null;
   for (const rx of refPatterns) {
@@ -83,10 +80,10 @@ function extractRangeAndRef(raw) {
   }
 
   const rangePatterns = [
-    /rango[^\d\u20AC]*([\d\.\,]+)\D+([\d\.\,]+)/i,
-    /entre[^\d\u20AC]*([\d\.\,]+)\D+([\d\.\,]+)\s*(?:\u20AC|euros?|eur)?/i,
-    /m[ií]nimo[^\d\u20AC]*([\d\.\,]+)[^\d]+m[aá]ximo[^\d\u20AC]*([\d\.\,]+)/i,
-    /([\d\.\,]+)\s*(?:\u20AC|euros?)\s*(?:a|-|–|—)\s*([\d\.\,]+)\s*(?:\u20AC|euros?)/i,
+    /rango[^\d\u20AC€]*([\d\.\,]+)\D+([\d\.\,]+)/i,
+    /entre[^\d\u20AC€]*([\d\.\,]+)\D+([\d\.\,]+)\s*(?:\u20AC|€|euros?|eur)?/i,
+    /m[ií]nimo[^\d\u20AC€]*([\d\.\,]+)[^\d]+m[aá]ximo[^\d\u20AC€]*([\d\.\,]+)/i,
+    /([\d\.\,]+)\s*(?:\u20AC|€|euros?)\s*(?:a|-|–|—)\s*([\d\.\,]+)\s*(?:\u20AC|€|euros?)/i,
   ];
   let min = null, max = null;
   for (const rx of rangePatterns) {
@@ -108,7 +105,6 @@ function extractRangeAndRef(raw) {
 function isOnSerpavi(urlStr) {
   try { return new URL(urlStr).hostname.includes("serpavi.mivau.gob.es"); } catch { return false; }
 }
-
 async function acceptCookiesIfAny(target) {
   const btns = [
     'button:has-text("Aceptar")',
@@ -116,7 +112,7 @@ async function acceptCookiesIfAny(target) {
     'button:has-text("ACEPTAR")',
     '[id*="aceptar"]',
     '[id*="accept"]',
-    'role=button[name=/acept|accept/i]',
+    'role=button[name=/acept|accept|de acuerdo/i]',
     'text=/De acuerdo/i',
     'text=/Aceptar cookies/i'
   ];
@@ -127,7 +123,6 @@ async function acceptCookiesIfAny(target) {
     } catch {}
   }
 }
-
 async function clickAny(target, selectors, ctx = null) {
   for (const sel of selectors) {
     const el = target.locator(sel).first();
@@ -146,26 +141,20 @@ async function clickAny(target, selectors, ctx = null) {
   }
   return false;
 }
-
 function getSerpaviFrame(page) {
   const frames = page.frames();
   for (const f of frames) {
-    try {
-      if (isOnSerpavi(f.url())) return f;
-    } catch {}
+    try { if (isOnSerpavi(f.url())) return f; } catch {}
   }
   return null;
 }
-
 async function gotoSerpavi(ctx) {
-  // 1) intento directo
   let page = await ctx.newPage();
   await page.goto("https://serpavi.mivau.gob.es/", { waitUntil: "domcontentloaded", timeout: 20000 }).catch(()=>{});
   await acceptCookiesIfAny(page).catch(()=>{});
   let frame = getSerpaviFrame(page);
   if (isOnSerpavi(page.url()) || frame) return { page, target: frame ?? page };
 
-  // 2) ir a la página informativa y abrir SERPAVI (misma pestaña o nueva)
   await page.goto("https://www.mivau.gob.es/vivienda/alquila-bien-es-tu-derecho/serpavi", { waitUntil: "domcontentloaded", timeout: 20000 }).catch(()=>{});
   await acceptCookiesIfAny(page).catch(()=>{});
   const candidates = [
@@ -183,13 +172,11 @@ async function gotoSerpavi(ctx) {
     if (isOnSerpavi(newPage.url()) || frame) return { page: newPage, target: frame ?? newPage };
   }
 
-  // 3) reintento directo
   await page.goto("https://serpavi.mivau.gob.es/", { waitUntil: "domcontentloaded", timeout: 20000 }).catch(()=>{});
   await acceptCookiesIfAny(page).catch(()=>{});
   frame = getSerpaviFrame(page);
   return { page, target: frame ?? page };
 }
-
 async function ensureSerpaviContext(ctx) {
   const { page, target } = await Promise.race([
     gotoSerpavi(ctx),
@@ -197,7 +184,6 @@ async function ensureSerpaviContext(ctx) {
   ]);
   return { page, target };
 }
-
 async function findInput(target, selectors) {
   for (const sel of selectors) {
     const el = target.locator(sel).first();
@@ -205,67 +191,45 @@ async function findInput(target, selectors) {
   }
   return null;
 }
-
 async function fillRC(target, rc) {
-  // intenta activar pestaña RC
   await clickAny(target, [
     'role=tab[name=/referencia\\s*catastral/i]',
     'role=radio[name=/(referencia|ref\\.)\\s*catastral/i]',
-    'text=/Referencia\\s*catastral/i'
+    'text=/Referencia\\s*catastral/i',
+    'text=/Buscar vivienda/i'
   ]).catch(()=>{});
 
   const input = await findInput(target, [
+    'input[placeholder*="Introduzca"][placeholder*="referencia" i]',
     'input[placeholder*="catastral" i]',
-    'input[name*="catastral" i]',
+    'input[placeholder*="buscar" i]',
     'input[aria-label*="catastral" i]',
-    'input[placeholder*="referencia" i]',
-    'input[name*="referencia" i]',
     'input[aria-label*="referencia" i]',
+    'input[name*="catastral" i]',
+    'input[name*="referencia" i]',
+    'input[type="search"]',
     'input[type="text"]'
   ]);
   if (!input) return false;
+
   await input.fill(rc, { timeout: 4000 }).catch(()=>{});
+  // Espera a que aparezca la sugerencia y selecciónala
+  await target.waitForTimeout?.(800).catch(()=>{});
+  const optionSel = [
+    '[role="option"]',
+    'ul[role="listbox"] li',
+    'li[role="option"]',
+    '.autocomplete li',
+    'li:has-text("/")' // direcciones suelen contener “/” o número
+  ];
+  for (const s of optionSel) {
+    const opt = target.locator(s).first();
+    if (await opt.count()) { await opt.click({ timeout: 1500 }).catch(()=>{}); break; }
+  }
+  // Enter como fallback
+  try { await input.press("Enter", { delay: 50 }); } catch {}
   return true;
 }
-
-// NUEVO: Home SERPAVI → buscar por RC evitando el buscador general del Ministerio
-async function searchByRCOnHome(target, rc) {
-  await target.waitForSelector('text=/Sistema Estatal de Referencia|Buscar vivienda/i', { timeout: 8000 }).catch(()=>{});
-
-  const scope = target.locator('section:has-text("Buscar vivienda"), form:has-text("Buscar vivienda")').first();
-
-  const cand = [
-    'input[placeholder*="referencia catastral" i]',
-    'input[placeholder*="Introduzca" i][placeholder*="referencia" i]',
-    'input[aria-label*="referencia catastral" i]',
-    'input[placeholder*="vía y número" i]',
-  ].map(sel => `${sel}:not(#buscador-general):not([name="texto_busqueda"])`);
-
-  let input = null;
-  for (const sel of cand) {
-    const el = (await scope.count() ? scope.locator(sel) : target.locator(sel)).first();
-    if (await el.count() && await el.isVisible().catch(()=>false)) { input = el; break; }
-  }
-  if (!input) {
-    const any = target.locator('input[type="text"]:not(#buscador-general):not([name="texto_busqueda"])');
-    if (await any.count()) input = any.first();
-  }
-  if (!input) throw new Error('RC_INPUT_NOT_FOUND_ON_APP');
-
-  await input.fill(rc, { timeout: 4000 }).catch(()=>{});
-  await target.waitForTimeout?.(500).catch(()=>{});
-
-  const opt = (await scope.count() ? scope.locator('[role="option"]') : target.locator('[role="option"]')).first();
-  if (await opt.count()) {
-    await opt.click({ timeout: 1500 }).catch(()=>{});
-  } else {
-    await input.press('Enter').catch(()=>{});
-  }
-
-  // formulario con campos auto: Municipio*, Superficie construida*, Referencia Catastral*
-  await target.waitForSelector('text=/Municipio\\*|Superficie construida\\*|Referencia\\s*Catastral\\*/i', { timeout: 15000 });
-}
-
 async function setSelectOrInput(target, labelRegex, value) {
   if (value == null || value === "") return;
   const sel = target.getByLabel(labelRegex, { exact: false }).first();
@@ -276,7 +240,6 @@ async function setSelectOrInput(target, labelRegex, value) {
     else await sel.fill(String(value));
   } catch {}
 }
-
 async function setRadioYesNo(target, groupRegex, yes) {
   if (yes == null) return;
   const group = target.getByRole("group", { name: groupRegex }).first();
@@ -291,7 +254,7 @@ async function setRadioYesNo(target, groupRegex, yes) {
 app.get("/health", (_req, res) => {
   res.json({ ok: true, ts: new Date().toISOString() });
 });
-
+// Diagnóstico simple de conectividad desde Render
 app.get("/diag", async (_req, res) => {
   try {
     const hdrs = { "User-Agent":"Mozilla/5.0", "Accept-Language":"es-ES,es;q=0.9" };
@@ -308,7 +271,6 @@ app.get("/diag", async (_req, res) => {
     res.status(500).json({ ok:false, error:String(e) });
   }
 });
-
 app.get("/", (_req, res) => {
   res.type("text/plain").send(
 `SERPAVI scraper
@@ -341,13 +303,13 @@ app.post("/", async (req, res) => {
     });
 
     const ctx = await browser.newContext({
-      viewport: { width: 1280, height: 900 },
+      viewport: { width: 1366, height: 900 },
       userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
       locale: "es-ES",
       ignoreHTTPSErrors: true,
     });
 
-    // Bloqueo de recursos pesados pero permitimos CSS/JS
+    // Bloqueo ligero (dejamos CSS/JS para que la SPA funcione)
     await ctx.route("**/*", (route) => {
       const req = route.request();
       const t = req.resourceType();
@@ -362,68 +324,108 @@ app.post("/", async (req, res) => {
       page.setDefaultTimeout(15000);
       target.setDefaultTimeout?.(15000);
 
-      // 1) en home → búsqueda por RC (evitando #buscador-general del Ministerio)
-      await searchByRCOnHome(target, String(rc));
+      // Entrar/continuar flujo
+      await clickAny(target, [
+        'role=button[name=/iniciar|acceder|consultar|buscar|calcular/i]',
+        'text=/Iniciar|Acceder|Consultar|Buscar|Calcular/i'
+      ], ctx).catch(()=>{});
 
-      // 2) atributos (checkbox/radio/select) que no se autocompletan
+      // RC (si no aparece, devolvemos artefactos para depurar)
+      let rcOk = false;
+      try { rcOk = await fillRC(target, String(rc)); } catch {}
+      if (!rcOk) {
+        const fullText = await (target.evaluate
+          ? target.evaluate(() => document.body.innerText || "")
+          : page.evaluate(() => document.body.innerText || ""));
+        const html = await (target.content ? target.content() : page.content()).catch(()=>null);
+        const shot = await (target.screenshot ? target.screenshot({ fullPage: true }).catch(()=>null) : page.screenshot({ fullPage:true }).catch(()=>null));
+        await ctx.close().catch(()=>{}); await browser.close().catch(()=>{});
+        return {
+          ok:false,
+          error:"RC_INPUT_NOT_FOUND_ON_APP",
+          currentUrl: page.url(),
+          frameUrl: target.url ? target.url() : null,
+          sample: fullText.slice(0,2000),
+          html: html ? html.slice(0,2000) : null,
+          screenshot_base64: shot ? Buffer.from(shot).toString("base64") : null
+        };
+      }
+
+      // Confirmar/buscar
+      await clickAny(target, [
+        'role=button[name=/buscar|consultar|calcular|continuar|siguiente|aceptar/i]',
+        'text=/Buscar|Consultar|Calcular|Continuar|Siguiente|Aceptar/i'
+      ], ctx);
+      const firstInput = target.getByRole ? target.getByRole("textbox").first() : null;
+      if (firstInput && await firstInput.count()) await firstInput.press("Enter").catch(()=>{});
+
+      // Atributos manuales
       await setSelectOrInput(target, /planta/i, planta);
       await setSelectOrInput(target, /estado/i, estado);
       const et = String(etiqueta || "").trim().toUpperCase();
       if (["A","B","C","D","E","F","G"].includes(et)) await setSelectOrInput(target, /etiqueta/i, et);
       await setRadioYesNo(target, /ascensor/i, !!ascensor);
       await setRadioYesNo(target, /(aparcamiento|parking)/i, !!aparcamiento);
-      await setRadioYesNo(target, /amueblada|amueblado/i, !!amueblado);
+      await setRadioYesNo(target, /amueblad/i, !!amueblado);
       await setRadioYesNo(target, /exterior/i, !!exterior);
       if (dormitorios != null) await setSelectOrInput(target, /dormitorios|habitaciones/i, dormitorios);
       if (banos != null)       await setSelectOrInput(target, /ba(ñ|n)os/i, banos);
 
-      // 3) calcular/continuar
+      // Calcular
       await clickAny(target, [
-        'role=button[name=/buscar|calcular|continuar|siguiente/i]',
-        'text=/Buscar|Calcular|Continuar|Siguiente/i'
+        'role=button[name=/buscar|calcular|continuar|siguiente|aceptar/i]',
+        'text=/Buscar|Calcular|Continuar|Siguiente|Aceptar/i'
       ], ctx);
 
-      // 4) esperar render
+      // Esperas
       await target.waitForLoadState?.("domcontentloaded", { timeout: 15000 }).catch(()=>{});
       await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(()=>{});
-      await target.waitForTimeout?.(1500).catch(()=>{});
+      await target.waitForTimeout?.(1200).catch(()=>{});
 
-      // 5) extraer importes (zonas donde suele aparecer el resultado)
+      // Extraer importes
       const anchors = [
         'text=/Precio\\s+de\\s+referencia/i',
         'text=/Rango/i',
         'section:has-text("Precio")',
         'div:has-text("Precio")',
         'main:has-text("Precio")',
-        'section:has-text("resultado")',
-        'div:has-text("resultado")'
       ];
-      let min=null,max=null,precio_ref=null, blockText = "";
+      let min=null,max=null,precio_ref=null, fullText=null;
       for (const sel of anchors) {
         const el = target.locator(sel).first();
         if (await el.count()) {
           const txt = await el.evaluate(n => n.innerText || "");
-          blockText += " " + txt;
           const r = extractRangeAndRef(txt);
           if (r.min != null && (min == null || r.min < min)) min = r.min;
           if (r.max != null && (max == null || r.max > max)) max = r.max;
           if (r.precio_ref != null) precio_ref = r.precio_ref;
         }
       }
-
       if (min==null && max==null && precio_ref==null) {
-        const fullText = await (target.evaluate
+        fullText = await (target.evaluate
           ? target.evaluate(() => document.body.innerText || "")
           : page.evaluate(() => document.body.innerText || ""));
         const r = extractRangeAndRef(fullText);
         min = r.min; max = r.max; precio_ref = r.precio_ref;
 
         if (!min && !max && !precio_ref) {
-          return { ok:false, error:"UI_CHANGED", currentUrl: page.url(), frameUrl: target.url ? target.url() : null, sample: fullText.slice(0,2000) };
+          const html = await (target.content ? target.content() : page.content()).catch(()=>null);
+          const shot = await (target.screenshot ? target.screenshot({ fullPage: true }).catch(()=>null) : page.screenshot({ fullPage:true }).catch(()=>null));
+          await ctx.close().catch(()=>{}); await browser.close().catch(()=>{});
+          return {
+            ok:false,
+            error:"UI_CHANGED",
+            currentUrl: page.url(),
+            frameUrl: target.url ? target.url() : null,
+            sample: fullText.slice(0,2000),
+            html: html ? html.slice(0,2000) : null,
+            screenshot_base64: shot ? Buffer.from(shot).toString("base64") : null
+          };
         }
       }
 
-      const out = sanitizeRange({ min, max, precio_ref }, blockText);
+      const out = sanitizeRange({ min, max, precio_ref }, fullText || "");
+      await ctx.close().catch(()=>{}); await browser.close().catch(()=>{});
       return { ok:true, min: out.min ?? null, max: out.max ?? null, precio_ref: out.precio_ref ?? null, rc, via:"playwright" };
     })();
 
