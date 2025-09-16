@@ -196,7 +196,10 @@ app.post("/", async (req, res) => {
       viewport: { width: 1280, height: 900 },
       userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
     });
-    const page = await ctx.newPage();
+    const page = await reachSerpaviApp(ctx);
+page.setDefaultTimeout(15000);
+page.setDefaultNavigationTimeout(20000);
+
 
     try {
       // 1) SERPAVI
