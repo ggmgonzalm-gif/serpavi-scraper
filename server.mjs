@@ -195,6 +195,17 @@ async function ensureSerpaviContext(ctx) {
     gotoSerpavi(ctx),
     new Promise((_, rej) => setTimeout(() => rej(new Error("SERPAVI_UNREACHABLE")), 25000))
   ]);
+
+  // si desvia al buscador general, reintenta una vez directo
+  const curUrl = target.url ? target.url() : page.url();
+  if (curUrl.includes("/buscador")) {
+    await page.goto("https://serpavi.mivau.gob.es/", { waitUntil: "domcontentloaded", timeout: 20000 }).catch(()=>{});
+    await acceptCookiesIfAny(page).catch(()=>{});
+    const frame = getSerpaviFrame(page);
+    const t2 = frame ?? page;
+    if (!isOnSerpavi(t2.url())) throw new Error("SERPAVI_UNREACHABLE");
+    return { page, target: t2 };
+  }
   return { page, target };
 }
 
@@ -207,7 +218,7 @@ async function findInput(target, selectors) {
 }
 
 async function fillRC(target, rc) {
-  // intenta activar pestaña RC
+  // activa pestaña RC si existe
   await clickAny(target, [
     'role=tab[name=/referencia\\s*catastral/i]',
     'role=radio[name=/(referencia|ref\\.)\\s*catastral/i]',
@@ -224,6 +235,13 @@ async function fillRC(target, rc) {
     'input[type="text"]'
   ]);
   if (!input) return false;
+
+  // si el input limita a 20, nos da pista de que es el correcto
+  try {
+    const max = await input.evaluate(el => el.maxLength);
+    if (max && max !== -1 && max < 20) return false;
+  } catch {}
+
   await input.fill(rc, { timeout: 4000 }).catch(()=>{});
   return true;
 }
@@ -264,8 +282,8 @@ app.get("/diag", async (_req, res) => {
     const bt = await b.text();
     res.json({
       ok: true,
-      serpavi: { status: a.status, length: at.length, sample: at.slice(0,200) },
-      info: { status: b.status, length: bt.length, sample: bt.slice(0,200) }
+      serpavi: { status: a.status, finalUrl: a.url, length: at.length, sample: at.slice(0,200) },
+      info: { status: b.status, finalUrl: b.url, length: bt.length, sample: bt.slice(0,200) }
     });
   } catch (e) {
     res.status(500).json({ ok:false, error:String(e) });
@@ -321,29 +339,36 @@ app.post("/", async (req, res) => {
     });
 
     const work = (async () => {
-      const { page, target } = await ensureSerpaviContext(ctx); // ← ahora captura nueva pestaña
+      const { page, target } = await ensureSerpaviContext(ctx);
       page.setDefaultTimeout(15000);
       target.setDefaultTimeout?.(15000);
 
-      // Entrar/continuar flujo
+      // Entrar/continuar flujo: SOLO botones, no textos genéricos
       await clickAny(target, [
-        'role=button[name=/iniciar|acceder|consultar|buscar|calcular/i]',
-        'text=/Iniciar|Acceder|Consultar|Buscar|Calcular/i'
+        'button:has-text("Iniciar")',
+        'button:has-text("Acceder")',
+        'button:has-text("Consultar")',
+        'button:has-text("Calcular")',
+        'button:has-text("Siguiente")',
+        'button[aria-label*="consultar" i]',
+        'button[aria-label*="calcular" i]'
       ], ctx).catch(()=>{});
 
-      // RC
+      // RC (no enviar Enter para evitar buscadores globales)
       const rcOk = await fillRC(target, String(rc));
       if (!rcOk) {
         return { ok:false, error:"RC_INPUT_NOT_FOUND", currentUrl: page.url(), frameUrl: target.url ? target.url() : null };
       }
       await clickAny(target, [
-        'role=button[name=/buscar|consultar|calcular|continuar|siguiente/i]',
-        'text=/Buscar|Consultar|Calcular|Continuar|Siguiente/i'
+        'button:has-text("Consultar")',
+        'button:has-text("Calcular")',
+        'button:has-text("Continuar")',
+        'button:has-text("Siguiente")',
+        'button[aria-label*="consultar" i]',
+        'button[aria-label*="calcular" i]'
       ], ctx);
-      const firstInput = target.getByRole ? target.getByRole("textbox").first() : null;
-      if (firstInput && await firstInput.count()) await firstInput.press("Enter").catch(()=>{});
 
-      // Atributos
+      // Atributos (si aparecen)
       await setSelectOrInput(target, /planta/i, planta);
       await setSelectOrInput(target, /estado/i, estado);
       const et = String(etiqueta || "").trim().toUpperCase();
@@ -357,8 +382,10 @@ app.post("/", async (req, res) => {
 
       // Calcular
       await clickAny(target, [
-        'role=button[name=/buscar|calcular|continuar|siguiente/i]',
-        'text=/Buscar|Calcular|Continuar|Siguiente/i'
+        'button:has-text("Calcular")',
+        'button:has-text("Continuar")',
+        'button:has-text("Siguiente")',
+        'button[aria-label*="calcular" i]'
       ], ctx);
 
       // Esperar render
