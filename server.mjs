@@ -214,6 +214,13 @@ page.setDefaultNavigationTimeout(20000);
 
       // 3) RC
       await fillRC(page, String(rc));
+      await tryClick(page, [
+  'role=button[name=/buscar|consultar|calcular|continuar|siguiente/i]',
+  'text=/Buscar|Consultar|Calcular|Continuar|Siguiente/i'
+]);
+const firstInput = page.getByRole("textbox").first();
+if (await firstInput.count()) await firstInput.press("Enter").catch(()=>{});
+
 
       // 4) Atributos (si aparecen)
       await setSelectOrInput(page, /planta/i, planta);
