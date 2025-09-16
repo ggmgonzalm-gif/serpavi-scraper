@@ -18,6 +18,33 @@ app.use((req, res, next) => {
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
+async function reachSerpaviApp(ctx) {
+  let page = await ctx.newPage();
+  // intento directo
+  await page.goto("https://serpavi.mivau.gob.es/", { waitUntil: "domcontentloaded", timeout: 60000 }).catch(()=>{});
+  await acceptCookiesIfAny(page).catch(()=>{});
+  try { if (new URL(page.url()).hostname === "serpavi.mivau.gob.es") return page; } catch {}
+  // fallback: entrar por la página informativa y saltar a SERPAVI
+  await page.goto("https://www.mivau.gob.es/vivienda/alquila-bien-es-tu-derecho/serpavi", { waitUntil: "domcontentloaded", timeout: 60000 }).catch(()=>{});
+  await acceptCookiesIfAny(page).catch(()=>{});
+  const candidates = [
+    'a[href*="serpavi.mivau.gob.es"]',
+    'a:has-text("SERPAVI")',
+    'a:has-text("Sistema Estatal de Referencia")'
+  ];
+  for (const sel of candidates) {
+    const el = page.locator(sel).first();
+    if (await el.count()) {
+      const [newPage] = await Promise.all([ctx.waitForEvent("page").catch(()=>null), el.click({ button:"middle" }).catch(()=>{})]);
+      if (newPage) {
+        await newPage.waitForLoadState("domcontentloaded").catch(()=>{});
+        await acceptCookiesIfAny(newPage).catch(()=>{});
+        try { if (new URL(newPage.url()).hostname === "serpavi.mivau.gob.es") return newPage; } catch {}
+      }
+    }
+  }
+  return page;
+}
 
 // --- Utils
 const toNum = (s) => {
