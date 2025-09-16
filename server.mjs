@@ -47,7 +47,6 @@ function sanitizeRange({ min, max, precio_ref }, text) {
   return { min, max, precio_ref };
 }
 
-// Busca TODOS los importes con € y escoge un rango coherente
 function pickRangeFromText(text) {
   const nums = [];
   const rx = /([\d]{2,3}(?:\.\d{3})*(?:,\d{1,2})?)\s*(?:\u20AC|euros?|eur)/gi;
@@ -64,11 +63,10 @@ function pickRangeFromText(text) {
   return { min: nums[0] ?? null, max: nums[1] ?? null };
 }
 
-// Extrae precios desde texto visible (varias variantes de SERPAVI)
+// Extrae precios desde texto visible
 function extractRangeAndRef(raw) {
   const t = String(raw || "").replace(/\s+/g, " ");
 
-  // Precio referencia (dirigido)
   const refPatterns = [
     /precio\s+de\s+referencia[^\d\u20AC]*([\d\.\,]+)/i,
     /precio\s+referencia[^\d\u20AC]*([\d\.\,]+)/i,
@@ -81,7 +79,6 @@ function extractRangeAndRef(raw) {
     if (m) { precio_ref = eurToNum(m[1]); break; }
   }
 
-  // Rango (900 – 1.100 €, 900-1100 €, etc.)
   const rangePatterns = [
     /rango[^\d\u20AC]*([\d\.\,]+)\D+([\d\.\,]+)/i,
     /entre[^\d\u20AC]*([\d\.\,]+)\D+([\d\.\,]+)\s*(?:\u20AC|euros?|eur)?/i,
@@ -94,10 +91,7 @@ function extractRangeAndRef(raw) {
     if (m) { min = eurToNum(m[1]); max = eurToNum(m[2]); break; }
   }
 
-  // Saneado inicial
   let out = sanitizeRange({ min, max, precio_ref }, t);
-
-  // Fallback: elegir por lista de importes con €
   if ((out.min == null && out.max == null) || (out.max != null && out.max < 100)) {
     const fb = pickRangeFromText(t);
     out = sanitizeRange({ ...out, ...fb }, t);
@@ -127,34 +121,45 @@ async function tryClick(page, selectors) {
   for (const sel of selectors) {
     const el = page.locator(sel).first();
     if (await el.count()) {
-      await el.click({ timeout: 1500 }).catch(()=>{});
+      await Promise.race([
+        page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 6000 }).catch(()=>{}),
+        el.click({ timeout: 1500 }).catch(()=>{})
+      ]);
       return true;
     }
   }
   return false;
 }
 
+function isOnSerpavi(urlStr) {
+  try { return new URL(urlStr).hostname.includes("serpavi.mivau.gob.es"); } catch { return false; }
+}
+
 async function fillRC(page, rc) {
+  if (!isOnSerpavi(page.url())) return false; // ⚠️ SOLO en SERPAVI
+  // Abrir pestaña "Referencia catastral" si existe
   const tabRC = page.getByRole("tab", { name: /referencia\s+catastral/i }).first();
   if (await tabRC.count()) await tabRC.click().catch(()=>{});
 
+  // Inputs específicos (evita el buscador general del ministerio)
   const inputs = [
     'input[placeholder*="catastral" i]',
     'input[name*="catastral" i]',
     'input[aria-label*="catastral" i]',
-    'input[type="search"]',
+    'input[placeholder*="referencia" i]',
+    'input[name*="referencia" i]',
+    'input[aria-label*="referencia" i]',
   ];
   for (const sel of inputs) {
     const el = page.locator(sel).first();
     if (await el.count()) { await el.fill(rc); return true; }
   }
-  const any = page.getByRole("textbox").first();
-  if (await any.count()) { await any.fill(rc); return true; }
   return false;
 }
 
 async function setSelectOrInput(page, labelRegex, value) {
   if (value == null || value === "") return;
+  if (!isOnSerpavi(page.url())) return; // solo si estamos en SERPAVI
   const sel = page.getByLabel(labelRegex, { exact: false }).first();
   if (!(await sel.count())) return;
   try {
@@ -166,6 +171,7 @@ async function setSelectOrInput(page, labelRegex, value) {
 
 async function setRadioYesNo(page, groupRegex, yes) {
   if (yes == null) return;
+  if (!isOnSerpavi(page.url())) return;
   const group = page.getByRole("group", { name: groupRegex }).first();
   if (!(await group.count())) return;
   const target = group.getByRole("radio", { name: yes ? /s[ií]|yes/i : /no/i }).first();
@@ -173,35 +179,40 @@ async function setRadioYesNo(page, groupRegex, yes) {
 }
 
 async function reachSerpaviApp(ctx) {
-  let page = await ctx.newPage();
+  const page = await ctx.newPage();
+
+  // intento directo rápido
   await page.goto("https://serpavi.mivau.gob.es/", { waitUntil: "domcontentloaded", timeout: 15000 }).catch(()=>{});
   await acceptCookiesIfAny(page).catch(()=>{});
-  try { if (new URL(page.url()).hostname === "serpavi.mivau.gob.es") return page; } catch {}
+  if (isOnSerpavi(page.url())) return page;
+
+  // ir a página informativa y buscar enlace a la app (mismo tab)
   await page.goto("https://www.mivau.gob.es/vivienda/alquila-bien-es-tu-derecho/serpavi", { waitUntil: "domcontentloaded", timeout: 15000 }).catch(()=>{});
   await acceptCookiesIfAny(page).catch(()=>{});
-  const candidates = [
+  await tryClick(page, [
     'a[href*="serpavi.mivau.gob.es"]',
     'a:has-text("SERPAVI")',
     'a:has-text("Sistema Estatal de Referencia")',
     'a:has-text("precio del alquiler")',
-  ];
-  for (const sel of candidates) {
-    const el = page.locator(sel).first();
-    if (await el.count()) {
-      const [newPage] = await Promise.all([
-        ctx.waitForEvent("page").catch(()=>null),
-        el.click({ button:"middle" }).catch(()=>{})
-      ]);
-      if (newPage) {
-        await newPage.waitForLoadState("domcontentloaded").catch(()=>{});
-        await acceptCookiesIfAny(newPage).catch(()=>{});
-        try { if (new URL(newPage.url()).hostname === "serpavi.mivau.gob.es") return newPage; } catch {}
-      }
-    }
-  }
+  ]);
+
+  if (isOnSerpavi(page.url())) return page;
+
+  // último intento directo
   await page.goto("https://serpavi.mivau.gob.es/", { waitUntil: "domcontentloaded", timeout: 15000 }).catch(()=>{});
   await acceptCookiesIfAny(page).catch(()=>{});
   return page;
+}
+
+async function ensureOnSerpavi(page, ctx) {
+  for (let i = 0; i < 3; i++) {
+    if (isOnSerpavi(page.url())) return page;
+    await tryClick(page, ['a[href*="serpavi.mivau.gob.es"]', 'a:has-text("SERPAVI")']);
+    if (isOnSerpavi(page.url())) return page;
+    await page.goto("https://serpavi.mivau.gob.es/", { waitUntil: "domcontentloaded", timeout: 8000 }).catch(()=>{});
+    await acceptCookiesIfAny(page).catch(()=>{});
+  }
+  throw new Error("SERPAVI_UNREACHABLE");
 }
 
 // ---------- Rutas ----------
@@ -257,31 +268,35 @@ app.post("/", async (req, res) => {
       return route.continue();
     });
 
-    // ⏱️ Todo el scraping va DENTRO de una carrera con timeout global
     const doWork = (async () => {
-      // 1) Llegar a la app (timeout propio 15s)
+      // 1) Llegar y asegurar app SERPAVI (con guard)
       const page = await Promise.race([
         reachSerpaviApp(ctx),
         new Promise((_, rej) => setTimeout(()=>rej(new Error('SERPAVI_UNREACHABLE')), 15000))
       ]);
+      await ensureOnSerpavi(page, ctx).catch((e)=>{ throw e; });
 
       page.setDefaultTimeout(12000);
       page.setDefaultNavigationTimeout(15000);
 
-      // 2) Entrar/continuar
+      // 2) Entrar/continuar flujo dentro de SERPAVI
       await tryClick(page, [
         'role=button[name=/iniciar|acceder|consultar|buscar|calcular/i]',
         'text=/Iniciar|Acceder|Consultar|Buscar|Calcular/i'
       ]).catch(()=>{});
 
-      // 3) RC
-      await fillRC(page, String(rc));
+      // 3) RC (SOLO dentro de SERPAVI)
+      const rcOk = await fillRC(page, String(rc));
+      if (!rcOk) {
+        const cur = page.url();
+        throw new Error(`RC_INPUT_NOT_FOUND (url=${cur})`);
+      }
       await tryClick(page, [
         'role=button[name=/buscar|consultar|calcular|continuar|siguiente/i]',
         'text=/Buscar|Consultar|Calcular|Continuar|Siguiente/i'
       ]);
       const firstInput = page.getByRole("textbox").first();
-      if (await firstInput.count()) await firstInput.press("Enter").catch(()=>{});
+      if (await firstInput.count() && isOnSerpavi(page.url())) await firstInput.press("Enter").catch(()=>{});
 
       // 4) Atributos
       await setSelectOrInput(page, /planta/i, planta);
@@ -305,7 +320,7 @@ app.post("/", async (req, res) => {
       await page.waitForTimeout(2000);
       await page.waitForLoadState("networkidle", { timeout: 12000 }).catch(()=>{});
 
-      // 7) Extraer importes (anclas + fallback body)
+      // 7) Extraer importes
       const anchors = [
         'text=/Precio\\s+de\\s+referencia/i',
         'text=/Rango/i',
@@ -335,6 +350,7 @@ app.post("/", async (req, res) => {
             ok:false,
             error:"UI_CHANGED",
             hint:"Ajustar patrones en extractRangeAndRef()",
+            currentUrl: page.url(),
             sample: fullText.slice(0,2000)
           };
         }
