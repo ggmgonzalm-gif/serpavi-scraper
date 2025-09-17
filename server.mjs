@@ -68,37 +68,53 @@ function pickRangeFromText(text) {
 function extractRangeAndRef(raw) {
   const t = String(raw || "").replace(/\s+/g, " ");
 
-  const refPatterns = [
-    /precio\s+de\s+referencia[^\d\u20AC]*([\d\.\,]+)/i,
-    /precio\s+referencia[^\d\u20AC]*([\d\.\,]+)/i,
-    /precio\s+m[aá]ximo\s+de\s+referencia[^\d\u20AC]*([\d\.\,]+)/i,
-    /referencia:\s*([\d\.\,]+)\s*(?:\u20AC|€|euros?)/i,
-  ];
+  // Precio de referencia (solo si aparece el texto clave)
   let precio_ref = null;
-  for (const rx of refPatterns) {
-    const m = t.match(rx);
-    if (m) { precio_ref = eurToNum(m[1]); break; }
+  {
+    const m = t.match(/precio\s+(?:de\s+)?referencia[^\d€]*([\d\.]+,\d{1,2}|[\d\.]+)/i);
+    if (m) {
+      const v = eurToNum(m[1]);
+      if (v != null && v >= 200 && v <= 20000) precio_ref = v;
+    }
   }
 
-  const rangePatterns = [
-    /rango[^\d\u20AC]*([\d\.\,]+)\D+([\d\.\,]+)/i,
-    /entre[^\d\u20AC]*([\d\.\,]+)\D+([\d\.\,]+)\s*(?:\u20AC|€|euros?|eur)?/i,
-    /m[ií]nimo[^\d\u20AC]*([\d\.\,]+)[^\d]+m[aá]ximo[^\d\u20AC]*([\d\.\,]+)/i,
-    /([\d\.\,]+)\s*(?:\u20AC|€|euros?)\s*(?:a|-|–|—)\s*([\d\.\,]+)\s*(?:\u20AC|€|euros?)/i,
+  // Rango explícito (con palabras clave y € cerca)
+  const rangeRegs = [
+    /rango[^€\d]*([\d\.]+(?:,\d{1,2})?)\s*(?:€|euros?)\D+([\d\.]+(?:,\d{1,2})?)\s*(?:€|euros?)/i,
+    /entre[^€\d]*([\d\.]+(?:,\d{1,2})?)\s*(?:€|euros?)\D+([\d\.]+(?:,\d{1,2})?)\s*(?:€|euros?)/i,
+    /m[ií]nimo[^€\d]*([\d\.]+(?:,\d{1,2})?)\s*(?:€|euros?).{0,40}?m[aá]ximo[^€\d]*([\d\.]+(?:,\d{1,2})?)\s*(?:€|euros?)/i,
+    /([\d\.]+(?:,\d{1,2})?)\s*(?:€|euros?)\s*(?:a|-|–|—)\s*([\d\.]+(?:,\d{1,2})?)\s*(?:€|euros?)/i
   ];
   let min = null, max = null;
-  for (const rx of rangePatterns) {
+  for (const rx of rangeRegs) {
     const m = t.match(rx);
-    if (m) { min = eurToNum(m[1]); max = eurToNum(m[2]); break; }
+    if (m) {
+      const a = eurToNum(m[1]), b = eurToNum(m[2]);
+      if (a!=null && b!=null) { min = Math.min(a,b); max = Math.max(a,b); }
+      break;
+    }
   }
 
-  let out = sanitizeRange({ min, max, precio_ref }, t);
-  if ((out.min == null && out.max == null)) {
-    const fb = pickRangeFromText(t);
-    out = sanitizeRange({ ...out, ...fb }, t);
+  // Filtro anti-años: descarta 1800–2100
+  const isYearLike = (v) => v>=1800 && v<=2100;
+  if (min!=null && isYearLike(min)) min=null;
+  if (max!=null && isYearLike(max)) max=null;
+
+  // Si seguimos sin rango, intenta recoger TODOS los importes con € del bloque y escoger 2 plausibles
+  if (min==null && max==null) {
+    const euros = [...t.matchAll(/([\d]{1,3}(?:\.\d{3})*(?:,\d{1,2})?)\s*(?:€|euros?)/gi)]
+      .map(m=>eurToNum(m[1]))
+      .filter(v => v!=null && v>=200 && v<=20000 && !isYearLike(v))
+      .sort((a,b)=>a-b);
+    if (euros.length>=2) { min = euros[0]; max = euros[euros.length-1]; }
   }
+
+  // Saneado final
+  const out = sanitizeRange({ min, max, precio_ref }, t);
+  if (out.min!=null && out.max!=null && out.min>out.max) [out.min,out.max]=[out.max,out.min];
   return out;
 }
+
 
 // =============================================
 // Playwright helpers
