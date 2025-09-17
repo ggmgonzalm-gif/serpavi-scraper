@@ -2,8 +2,8 @@
 // SERPAVI scraper HTTP (Express + Playwright)
 // - POST /  { rc, ascensor, planta, estado, etiqueta, aparcamiento?, amueblado?, dormitorios?, banos?, exterior? }
 // - GET  /health
-// - GET  /diag   (diagnóstico de conectividad)
-// Devuelve: { ok:true, min, max, precio_ref, via:"playwright" }  (o { ok:false, error, ...debug })
+// - GET  /diag
+// Devuelve: { ok:true, min, max, precio_ref, total?, psqm?, via:"playwright" }  (o { ok:false, error, ...debug })
 
 import express from "express";
 import { chromium } from "playwright";
@@ -36,6 +36,7 @@ function eurToNum(s) {
   const v = Number(String(s).replace(/\./g, "").replace(",", "."));
   return Number.isFinite(v) ? v : null;
 }
+
 function sanitizeRange({ min, max, precio_ref }, text) {
   if (min != null && max != null && min > max) [min, max] = [max, min];
   const plausible = (x) => x != null && x >= 100 && x <= 20000;
@@ -48,29 +49,29 @@ function sanitizeRange({ min, max, precio_ref }, text) {
   }
   return { min, max, precio_ref };
 }
-// Evita coger “años” sueltos: exigimos símbolo € o literal euros
+
 function pickRangeFromText(text) {
+  // Solo importes con símbolo de € para evitar años como 2023
   const nums = [];
-  const rx = /([\d]{2,3}(?:\.\d{3})*(?:,\d{1,2})?)\s*(?:\u20AC|€|euros?|eur)\b/gi;
+  const rx = /([\d]{1,3}(?:\.\d{3})*(?:,\d{1,2})?)\s*(?:\u20AC|€|euros?|eur)/gi;
   let m;
   while ((m = rx.exec(text)) !== null) {
     const v = eurToNum(m[1]);
     if (v != null) nums.push(v);
   }
   nums.sort((a, b) => a - b);
-  for (let i = 0; i < nums.length - 1; i++) {
-    const a = nums[i], b = nums[i + 1];
-    if (a >= 100 && b >= 100 && b - a >= 10) return { min: a, max: b };
-  }
-  return { min: nums[0] ?? null, max: nums[1] ?? null };
+  if (nums.length >= 2) return { min: nums[0], max: nums[nums.length - 1] };
+  if (nums.length === 1) return { min: null, max: nums[0] };
+  return { min: null, max: null };
 }
+
 function extractRangeAndRef(raw) {
   const t = String(raw || "").replace(/\s+/g, " ");
 
   const refPatterns = [
-    /precio\s+de\s+referencia[^\d\u20AC€]*([\d\.\,]+)/i,
-    /precio\s+referencia[^\d\u20AC€]*([\d\.\,]+)/i,
-    /precio\s+m[aá]ximo\s+de\s+referencia[^\d\u20AC€]*([\d\.\,]+)/i,
+    /precio\s+de\s+referencia[^\d\u20AC]*([\d\.\,]+)/i,
+    /precio\s+referencia[^\d\u20AC]*([\d\.\,]+)/i,
+    /precio\s+m[aá]ximo\s+de\s+referencia[^\d\u20AC]*([\d\.\,]+)/i,
     /referencia:\s*([\d\.\,]+)\s*(?:\u20AC|€|euros?)/i,
   ];
   let precio_ref = null;
@@ -80,9 +81,9 @@ function extractRangeAndRef(raw) {
   }
 
   const rangePatterns = [
-    /rango[^\d\u20AC€]*([\d\.\,]+)\D+([\d\.\,]+)/i,
-    /entre[^\d\u20AC€]*([\d\.\,]+)\D+([\d\.\,]+)\s*(?:\u20AC|€|euros?|eur)?/i,
-    /m[ií]nimo[^\d\u20AC€]*([\d\.\,]+)[^\d]+m[aá]ximo[^\d\u20AC€]*([\d\.\,]+)/i,
+    /rango[^\d\u20AC]*([\d\.\,]+)\D+([\d\.\,]+)/i,
+    /entre[^\d\u20AC]*([\d\.\,]+)\D+([\d\.\,]+)\s*(?:\u20AC|€|euros?|eur)?/i,
+    /m[ií]nimo[^\d\u20AC]*([\d\.\,]+)[^\d]+m[aá]ximo[^\d\u20AC]*([\d\.\,]+)/i,
     /([\d\.\,]+)\s*(?:\u20AC|€|euros?)\s*(?:a|-|–|—)\s*([\d\.\,]+)\s*(?:\u20AC|€|euros?)/i,
   ];
   let min = null, max = null;
@@ -92,7 +93,7 @@ function extractRangeAndRef(raw) {
   }
 
   let out = sanitizeRange({ min, max, precio_ref }, t);
-  if ((out.min == null && out.max == null) || (out.max != null && out.max < 100)) {
+  if ((out.min == null && out.max == null)) {
     const fb = pickRangeFromText(t);
     out = sanitizeRange({ ...out, ...fb }, t);
   }
@@ -105,131 +106,126 @@ function extractRangeAndRef(raw) {
 function isOnSerpavi(urlStr) {
   try { return new URL(urlStr).hostname.includes("serpavi.mivau.gob.es"); } catch { return false; }
 }
+
 async function acceptCookiesIfAny(target) {
   const btns = [
     'button:has-text("Aceptar")',
     'button:has-text("Acepto")',
     'button:has-text("ACEPTAR")',
+    'button:has-text("De acuerdo")',
     '[id*="aceptar"]',
     '[id*="accept"]',
     'role=button[name=/acept|accept|de acuerdo/i]',
-    'text=/De acuerdo/i',
-    'text=/Aceptar cookies/i'
+    'text=/Aceptar cookies/i',
   ];
   for (const sel of btns) {
     try {
       const el = target.locator(sel).first();
-      if (await el.count()) { await el.click({ timeout: 1000 }).catch(() => {}); }
+      if (await el.count()) { await el.click({ timeout: 1200 }).catch(() => {}); }
     } catch {}
   }
 }
-async function clickAny(target, selectors, ctx = null) {
+
+async function clickAny(target, selectors) {
   for (const sel of selectors) {
     const el = target.locator(sel).first();
     if (await el.count()) {
-      let popup = null;
-      if (ctx) {
-        popup = await Promise.race([
-          ctx.waitForEvent("page", { timeout: 7000 }).catch(()=>null),
-          el.click({ timeout: 2000 }).then(()=>null).catch(()=>null)
-        ]);
-      } else {
-        await el.click({ timeout: 2000 }).catch(()=>{});
-      }
-      return popup || true;
+      await el.click({ timeout: 2000 }).catch(()=>{});
+      return true;
     }
   }
   return false;
 }
-function getSerpaviFrame(page) {
+
+function serpaviFrame(page) {
   const frames = page.frames();
   for (const f of frames) {
     try { if (isOnSerpavi(f.url())) return f; } catch {}
   }
   return null;
 }
+
 async function gotoSerpavi(ctx) {
+  // Intento directo
   let page = await ctx.newPage();
   await page.goto("https://serpavi.mivau.gob.es/", { waitUntil: "domcontentloaded", timeout: 20000 }).catch(()=>{});
   await acceptCookiesIfAny(page).catch(()=>{});
-  let frame = getSerpaviFrame(page);
-  if (isOnSerpavi(page.url()) || frame) return { page, target: frame ?? page };
+  let target = serpaviFrame(page) || page;
+  if (isOnSerpavi(target.url?.() || page.url())) return { page, target };
 
-  await page.goto("https://www.mivau.gob.es/vivienda/alquila-bien-es-tu-derecho/serpavi", { waitUntil: "domcontentloaded", timeout: 20000 }).catch(()=>{});
-  await acceptCookiesIfAny(page).catch(()=>{});
-  const candidates = [
-    'a[href*="serpavi.mivau.gob.es"]',
-    'a:has-text("SERPAVI")',
-    'a:has-text("Sistema Estatal de Referencia")',
-    'a:has-text("precio del alquiler")',
-  ];
-  const opened = await clickAny(page, candidates, ctx);
-  if (opened && opened !== true) {
-    const newPage = opened;
-    await newPage.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(()=>{});
-    await acceptCookiesIfAny(newPage).catch(()=>{});
-    frame = getSerpaviFrame(newPage);
-    if (isOnSerpavi(newPage.url()) || frame) return { page: newPage, target: frame ?? newPage };
-  }
-
+  // Reintento directo (a veces carga lento)
   await page.goto("https://serpavi.mivau.gob.es/", { waitUntil: "domcontentloaded", timeout: 20000 }).catch(()=>{});
   await acceptCookiesIfAny(page).catch(()=>{});
-  frame = getSerpaviFrame(page);
-  return { page, target: frame ?? page };
+  target = serpaviFrame(page) || page;
+  return { page, target };
 }
+
 async function ensureSerpaviContext(ctx) {
   const { page, target } = await Promise.race([
     gotoSerpavi(ctx),
     new Promise((_, rej) => setTimeout(() => rej(new Error("SERPAVI_UNREACHABLE")), 25000))
   ]);
+  if (!isOnSerpavi(target.url?.() || page.url())) throw new Error("SERPAVI_UNREACHABLE");
   return { page, target };
 }
-async function findInput(target, selectors) {
-  for (const sel of selectors) {
-    const el = target.locator(sel).first();
-    if (await el.count()) return el;
+
+async function findSerpaviSearchInput(target) {
+  const candidates = [
+    // Muy específico
+    'input[placeholder*="Introduzca"][placeholder*="referencia" i]',
+    'input[placeholder*="referencia catastral" i]',
+    'input[aria-label*="Buscar vivienda" i]',
+    'input[placeholder*="Buscar vivienda" i]',
+    // Genérico pero solo en SERPAVI
+    'input[type="search"]',
+    'input[type="text"]',
+  ];
+  for (const sel of candidates) {
+    const loc = target.locator(sel).first();
+    if (await loc.count()) {
+      // Evita inputs ocultos (display:none/visibility:hidden)
+      try { await loc.waitFor({ state: "visible", timeout: 1500 }); } catch {}
+      if (await loc.isVisible()) return loc;
+    }
   }
   return null;
 }
-async function fillRC(target, rc) {
-  await clickAny(target, [
-    'role=tab[name=/referencia\\s*catastral/i]',
-    'role=radio[name=/(referencia|ref\\.)\\s*catastral/i]',
-    'text=/Referencia\\s*catastral/i',
-    'text=/Buscar vivienda/i'
-  ]).catch(()=>{});
 
-  const input = await findInput(target, [
-    'input[placeholder*="Introduzca"][placeholder*="referencia" i]',
-    'input[placeholder*="catastral" i]',
-    'input[placeholder*="buscar" i]',
-    'input[aria-label*="catastral" i]',
-    'input[aria-label*="referencia" i]',
-    'input[name*="catastral" i]',
-    'input[name*="referencia" i]',
-    'input[type="search"]',
-    'input[type="text"]'
-  ]);
+async function typeRCAndPickFirst(target, rc) {
+  const input = await findSerpaviSearchInput(target);
   if (!input) return false;
 
-  await input.fill(rc, { timeout: 4000 }).catch(()=>{});
-  // Espera a que aparezca la sugerencia y selecciónala
-  await target.waitForTimeout?.(800).catch(()=>{});
-  const optionSel = [
+  await input.click({ timeout: 1500 }).catch(()=>{});
+  await input.fill(rc, { timeout: 3000 }).catch(()=>{});
+  // esperar dropdown de sugerencias o resultados
+  await target.waitForTimeout?.(800);
+
+  // 1) Intento: pulsar ↓ + Enter
+  try {
+    await input.press("ArrowDown");
+    await input.press("Enter");
+  } catch {}
+
+  // 2) Clic en primera sugerencia visible
+  const suggestionSelectors = [
     '[role="option"]',
     'ul[role="listbox"] li',
     'li[role="option"]',
     '.autocomplete li',
-    'li:has-text("/")' // direcciones suelen contener “/” o número
+    '.mat-option',
+    'li:has-text("C/"), li:has-text("CL "), li:has-text("Av")',
   ];
-  for (const s of optionSel) {
-    const opt = target.locator(s).first();
-    if (await opt.count()) { await opt.click({ timeout: 1500 }).catch(()=>{}); break; }
+  for (const ss of suggestionSelectors) {
+    const first = target.locator(ss).first();
+    if (await first.count()) {
+      await first.click({ timeout: 1200 }).catch(()=>{});
+      break;
+    }
   }
-  // Enter como fallback
-  try { await input.press("Enter", { delay: 50 }); } catch {}
+
   return true;
 }
+
 async function setSelectOrInput(target, labelRegex, value) {
   if (value == null || value === "") return;
   const sel = target.getByLabel(labelRegex, { exact: false }).first();
@@ -240,12 +236,21 @@ async function setSelectOrInput(target, labelRegex, value) {
     else await sel.fill(String(value));
   } catch {}
 }
+
 async function setRadioYesNo(target, groupRegex, yes) {
   if (yes == null) return;
+  // Radios en grupo
   const group = target.getByRole("group", { name: groupRegex }).first();
-  if (!(await group.count())) return;
-  const radio = group.getByRole("radio", { name: yes ? /s[ií]|yes/i : /no/i }).first();
-  if (await radio.count()) await radio.check().catch(()=>{});
+  if (await group.count()) {
+    const radio = group.getByRole("radio", { name: yes ? /s[ií]|yes/i : /no/i }).first();
+    if (await radio.count()) { await radio.check().catch(()=>{}); return; }
+  }
+  // Checkbox con label directo (por si son checkboxes)
+  const check = target.getByLabel(groupRegex, { exact: false }).first();
+  if (await check.count()) {
+    const isChecked = await check.isChecked().catch(()=>false);
+    if (!!yes !== isChecked) await check.click().catch(()=>{});
+  }
 }
 
 // =============================================
@@ -254,23 +259,18 @@ async function setRadioYesNo(target, groupRegex, yes) {
 app.get("/health", (_req, res) => {
   res.json({ ok: true, ts: new Date().toISOString() });
 });
-// Diagnóstico simple de conectividad desde Render
+
 app.get("/diag", async (_req, res) => {
   try {
     const hdrs = { "User-Agent":"Mozilla/5.0", "Accept-Language":"es-ES,es;q=0.9" };
     const a = await fetch("https://serpavi.mivau.gob.es/", { headers: hdrs, redirect:"follow" });
     const at = await a.text();
-    const b = await fetch("https://www.mivau.gob.es/vivienda/alquila-bien-es-tu-derecho/serpavi", { headers: hdrs, redirect:"follow" });
-    const bt = await b.text();
-    res.json({
-      ok: true,
-      serpavi: { status: a.status, length: at.length, sample: at.slice(0,200) },
-      info: { status: b.status, length: bt.length, sample: bt.slice(0,200) }
-    });
+    res.json({ ok: true, serpavi: { status: a.status, length: at.length, sample: at.slice(0,200) }});
   } catch (e) {
     res.status(500).json({ ok:false, error:String(e) });
   }
 });
+
 app.get("/", (_req, res) => {
   res.type("text/plain").send(
 `SERPAVI scraper
@@ -280,6 +280,7 @@ POST /  { rc, ascensor, planta, estado, etiqueta, aparcamiento?, amueblado?, dor
 });
 
 app.post("/", async (req, res) => {
+  const started = Date.now();
   try {
     const {
       rc,
@@ -309,11 +310,11 @@ app.post("/", async (req, res) => {
       ignoreHTTPSErrors: true,
     });
 
-    // Bloqueo ligero (dejamos CSS/JS para que la SPA funcione)
+    // Bloqueo ligero (dejamos CSS/JS)
     await ctx.route("**/*", (route) => {
-      const req = route.request();
-      const t = req.resourceType();
-      const url = req.url();
+      const r = route.request();
+      const t = r.resourceType();
+      const url = r.url();
       if (["image","font","media"].includes(t)) return route.abort();
       if (/analytics|googletag|gtm|hotjar|matomo|doubleclick|facebook|cook/i.test(url)) return route.abort();
       return route.continue();
@@ -321,66 +322,49 @@ app.post("/", async (req, res) => {
 
     const work = (async () => {
       const { page, target } = await ensureSerpaviContext(ctx);
+
       page.setDefaultTimeout(15000);
       target.setDefaultTimeout?.(15000);
 
-      // Entrar/continuar flujo
-      await clickAny(target, [
-        'role=button[name=/iniciar|acceder|consultar|buscar|calcular/i]',
-        'text=/Iniciar|Acceder|Consultar|Buscar|Calcular/i'
-      ], ctx).catch(()=>{});
+      // Aceptar cookies en la app
+      await acceptCookiesIfAny(target).catch(()=>{});
 
-      // RC (si no aparece, devolvemos artefactos para depurar)
-      let rcOk = false;
-      try { rcOk = await fillRC(target, String(rc)); } catch {}
-      if (!rcOk) {
-        const fullText = await (target.evaluate
-          ? target.evaluate(() => document.body.innerText || "")
-          : page.evaluate(() => document.body.innerText || ""));
-        const html = await (target.content ? target.content() : page.content()).catch(()=>null);
-        const shot = await (target.screenshot ? target.screenshot({ fullPage: true }).catch(()=>null) : page.screenshot({ fullPage:true }).catch(()=>null));
-        await ctx.close().catch(()=>{}); await browser.close().catch(()=>{});
-        return {
-          ok:false,
-          error:"RC_INPUT_NOT_FOUND_ON_APP",
-          currentUrl: page.url(),
-          frameUrl: target.url ? target.url() : null,
-          sample: fullText.slice(0,2000),
-          html: html ? html.slice(0,2000) : null,
-          screenshot_base64: shot ? Buffer.from(shot).toString("base64") : null
-        };
+      // Buscar vivienda por RC (campo correcto)
+      const okInput = await typeRCAndPickFirst(target, String(rc));
+      if (!okInput) {
+        const html = await page.content().catch(()=>null);
+        const shot = await page.screenshot({ fullPage: true }).catch(()=>null);
+        return { ok:false, error:"RC_INPUT_NOT_FOUND_ON_APP", currentUrl: page.url(), frameUrl: target.url ? target.url() : null, html: html ? html.slice(0,1200) : null, screenshot_base64: shot ? Buffer.from(shot).toString("base64") : null };
       }
 
-      // Confirmar/buscar
-      await clickAny(target, [
-        'role=button[name=/buscar|consultar|calcular|continuar|siguiente|aceptar/i]',
-        'text=/Buscar|Consultar|Calcular|Continuar|Siguiente|Aceptar/i'
-      ], ctx);
-      const firstInput = target.getByRole ? target.getByRole("textbox").first() : null;
-      if (firstInput && await firstInput.count()) await firstInput.press("Enter").catch(()=>{});
+      // Esperar a que cargue la ficha/formulario con datos del catastro
+      // (miramos la presencia de campos típicos)
+      await target.waitForTimeout?.(1200);
+      await acceptCookiesIfAny(target).catch(()=>{});
+      const formAnchor = target.locator('text=/Sistema Estatal de Referencia|Municipio\\*|Provincia\\*|Referencia\\s+Catastral\\*/i').first();
+      await formAnchor.waitFor({ state: 'visible', timeout: 12000 }).catch(()=>{});
 
-      // Atributos manuales
+      // Rellenar atributos no automáticos
       await setSelectOrInput(target, /planta/i, planta);
       await setSelectOrInput(target, /estado/i, estado);
       const et = String(etiqueta || "").trim().toUpperCase();
       if (["A","B","C","D","E","F","G"].includes(et)) await setSelectOrInput(target, /etiqueta/i, et);
-      await setRadioYesNo(target, /ascensor/i, !!ascensor);
+      await setRadioYesNo(target, /ascensor|ascens/i, !!ascensor);
       await setRadioYesNo(target, /(aparcamiento|parking)/i, !!aparcamiento);
       await setRadioYesNo(target, /amueblad/i, !!amueblado);
       await setRadioYesNo(target, /exterior/i, !!exterior);
       if (dormitorios != null) await setSelectOrInput(target, /dormitorios|habitaciones/i, dormitorios);
       if (banos != null)       await setSelectOrInput(target, /ba(ñ|n)os/i, banos);
 
-      // Calcular
+      // Calcular / Consultar / Siguiente
       await clickAny(target, [
-        'role=button[name=/buscar|calcular|continuar|siguiente|aceptar/i]',
-        'text=/Buscar|Calcular|Continuar|Siguiente|Aceptar/i'
-      ], ctx);
+        'role=button[name=/calcular|consultar|siguiente|ver precio/i]',
+        'text=/Calcular|Consultar|Siguiente|Ver precio/i'
+      ]);
 
-      // Esperas
-      await target.waitForLoadState?.("domcontentloaded", { timeout: 15000 }).catch(()=>{});
-      await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(()=>{});
-      await target.waitForTimeout?.(1200).catch(()=>{});
+      // Espera de render
+      await target.waitForLoadState?.("domcontentloaded", { timeout: 12000 }).catch(()=>{});
+      await target.waitForTimeout?.(2000).catch(()=>{});
 
       // Extraer importes
       const anchors = [
@@ -389,44 +373,47 @@ app.post("/", async (req, res) => {
         'section:has-text("Precio")',
         'div:has-text("Precio")',
         'main:has-text("Precio")',
+        '[class*="precio"]',
       ];
-      let min=null,max=null,precio_ref=null, fullText=null;
+      let min=null,max=null,precio_ref=null, scopeText = "";
       for (const sel of anchors) {
         const el = target.locator(sel).first();
         if (await el.count()) {
           const txt = await el.evaluate(n => n.innerText || "");
+          scopeText += " " + txt;
           const r = extractRangeAndRef(txt);
-          if (r.min != null && (min == null || r.min < min)) min = r.min;
-          if (r.max != null && (max == null || r.max > max)) max = r.max;
-          if (r.precio_ref != null) precio_ref = r.precio_ref;
+          if (r.min!=null && (min==null || r.min<min)) min = r.min;
+          if (r.max!=null && (max==null || r.max>max)) max = r.max;
+          if (r.precio_ref!=null) precio_ref = r.precio_ref;
         }
       }
+
       if (min==null && max==null && precio_ref==null) {
-        fullText = await (target.evaluate
+        const fullText = await (target.evaluate
           ? target.evaluate(() => document.body.innerText || "")
           : page.evaluate(() => document.body.innerText || ""));
         const r = extractRangeAndRef(fullText);
         min = r.min; max = r.max; precio_ref = r.precio_ref;
 
         if (!min && !max && !precio_ref) {
-          const html = await (target.content ? target.content() : page.content()).catch(()=>null);
-          const shot = await (target.screenshot ? target.screenshot({ fullPage: true }).catch(()=>null) : page.screenshot({ fullPage:true }).catch(()=>null));
-          await ctx.close().catch(()=>{}); await browser.close().catch(()=>{});
-          return {
-            ok:false,
-            error:"UI_CHANGED",
-            currentUrl: page.url(),
-            frameUrl: target.url ? target.url() : null,
-            sample: fullText.slice(0,2000),
-            html: html ? html.slice(0,2000) : null,
-            screenshot_base64: shot ? Buffer.from(shot).toString("base64") : null
-          };
+          const shot = await page.screenshot({ fullPage: true }).catch(()=>null);
+          return { ok:false, error:"UI_CHANGED", currentUrl: page.url(), frameUrl: target.url ? target.url() : null, sample: fullText.slice(0,2000), screenshot_base64: shot ? Buffer.from(shot).toString("base64") : null };
         }
       }
 
-      const out = sanitizeRange({ min, max, precio_ref }, fullText || "");
-      await ctx.close().catch(()=>{}); await browser.close().catch(()=>{});
-      return { ok:true, min: out.min ?? null, max: out.max ?? null, precio_ref: out.precio_ref ?? null, rc, via:"playwright" };
+      const out = sanitizeRange({ min, max, precio_ref }, "");
+      const total = out.precio_ref ?? out.max ?? out.min ?? null;
+      const psqm = null; // si en el futuro se obtiene €/m², completar aquí
+
+      return {
+        ok:true,
+        min: out.min ?? null,
+        max: out.max ?? null,
+        precio_ref: out.precio_ref ?? null,
+        total, psqm,
+        rc, via:"playwright",
+        ms: Date.now()-started
+      };
     })();
 
     const result = await Promise.race([
