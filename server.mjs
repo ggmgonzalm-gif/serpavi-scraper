@@ -3,7 +3,7 @@
 // - POST /  { rc, etiqueta, estado, planta, ascensor?, aparcamiento?, amueblada?, conserjeria?, vistas?, piscina?, zonas?, debug? }
 // - GET  /health
 // - GET  /diag
-// Devuelve: { ok:true, min, max, precio_ref, total, psqm, via:"playwright" }  (debug: +html/sample/screenshot)
+// Devuelve: { ok:true, min, max, precio_ref, total, psqm, via:"playwright" }  (debug: +html/sample)
 
 import express from "express";
 import { chromium } from "playwright";
@@ -37,7 +37,6 @@ function eurToNum(s) {
   return Number.isFinite(v) ? v : null;
 }
 
-// Solo aceptamos importes con € (evita años como 2023)
 function pickRangeFromText(text) {
   const nums = [];
   const rx = /([\d]{2,3}(?:\.\d{3})*(?:,\d{1,2})?)\s*(?:€|euros?)/gi;
@@ -61,11 +60,9 @@ function sanitizeRange({ min, max, precio_ref }) {
   return { min, max, precio_ref };
 }
 
-// Extrae precios desde texto visible (requiere €)
 function extractRangeAndRef(raw) {
   const t = String(raw || "").replace(/\s+/g, " ");
 
-  // Precio referencia – exige símbolo de € o 'euros'
   const refPatterns = [
     /precio\s+de\s+referencia[^€\d]*([\d\.\,]+)\s*(?:€|euros?)/i,
     /precio\s+referencia[^€\d]*([\d\.\,]+)\s*(?:€|euros?)/i,
@@ -77,7 +74,6 @@ function extractRangeAndRef(raw) {
     if (m) { precio_ref = eurToNum(m[1]); break; }
   }
 
-  // Rango (…€ a …€, …€ – …€)
   const rangePatterns = [
     /entre[^€\d]*([\d\.\,]+)\s*(?:€|euros?).{0,20}?([\d\.\,]+)\s*(?:€|euros?)/i,
     /([\d\.\,]+)\s*(?:€|euros?)\s*(?:a|-|–|—)\s*([\d\.\,]+)\s*(?:€|euros?)/i,
@@ -89,13 +85,11 @@ function extractRangeAndRef(raw) {
     if (m) { min = eurToNum(m[1]); max = eurToNum(m[2]); break; }
   }
 
-  // Fallback con lista de importes con €
   if (min == null && max == null) {
     const fb = pickRangeFromText(t);
     min = fb.min; max = fb.max;
   }
 
-  // €/m² si aparece
   let psqm = null;
   const m2a = t.match(/([\d\.\,]+)\s*€\s*\/\s*m²/i) || t.match(/([\d\.\,]+)\s*€\s*\/\s*m2/i);
   if (m2a) psqm = eurToNum(m2a[1]);
@@ -143,13 +137,11 @@ function getSerpaviFrame(page) {
 async function gotoSerpavi(ctx) {
   let page = await ctx.newPage();
 
-  // intento directo
   await page.goto(SERPAVI, { waitUntil: "domcontentloaded", timeout: 20000 }).catch(()=>{});
   await acceptCookiesIfAny(page).catch(()=>{});
   let target = getSerpaviFrame(page) ?? page;
   if (isOnSerpavi(target.url())) return { page, target };
 
-  // informativa + click a la app (misma pestaña o popup)
   await page.goto("https://www.mivau.gob.es/vivienda/alquila-bien-es-tu-derecho/serpavi", { waitUntil: "domcontentloaded", timeout: 20000 }).catch(()=>{});
   await acceptCookiesIfAny(page).catch(()=>{});
   const link = page.locator('a[href*="serpavi.mivau.gob.es"], a:has-text("SERPAVI")').first();
@@ -165,7 +157,6 @@ async function gotoSerpavi(ctx) {
     return { page: newPage, target };
   }
 
-  // reintento directo
   await page.goto(SERPAVI, { waitUntil: "domcontentloaded", timeout: 20000 }).catch(()=>{});
   await acceptCookiesIfAny(page).catch(()=>{});
   target = getSerpaviFrame(page) ?? page;
@@ -180,49 +171,65 @@ async function ensureSerpaviContext(ctx) {
   return { page, target };
 }
 
-// Busca el input “Introduzca referencia catastral o dirección…”, rellena y lanza búsqueda
+// ---- NUEVO: localizador robusto del input de RC ----
+async function findRcInput(target) {
+  // 1) candidatos por placeholder/aria/label
+  const candidates = [
+    target.getByPlaceholder(/introduzca.*referencia/i),
+    target.getByPlaceholder(/referencia.*catastral/i),
+    target.getByPlaceholder(/dirección completa/i),
+    target.getByRole("textbox", { name: /Buscar vivienda|referencia|catastral/i }),
+    target.locator('input[aria-label*="referencia" i]'),
+    target.locator('input[aria-label*="Buscar vivienda" i]'),
+    target.locator('input[formcontrolname="texto"]'),
+    target.locator('input[type="search"]:not(#buscador-general)'),
+    target.locator('input[type="text"]:not(#buscador-general)')
+  ];
+
+  // 2) filtra visibles y NO “buscador general” del header
+  for (const cand of candidates) {
+    const count = await cand.count().catch(()=>0);
+    for (let i=0;i<count;i++){
+      const el = cand.nth(i);
+      if (!(await el.isVisible().catch(()=>false))) continue;
+      const id = (await el.getAttribute("id").catch(()=>null)) || "";
+      const name = (await el.getAttribute("name").catch(()=>null)) || "";
+      const ph = (await el.getAttribute("placeholder").catch(()=>null)) || "";
+      if (/buscador-general|texto_busqueda/i.test(id+name)) continue;
+      if (/^buscar(\.\.\.)?$/i.test(ph.trim())) continue;
+      return el;
+    }
+  }
+
+  // 3) anclado al texto “Buscar vivienda:”
+  const container = target.locator('text=/Buscar vivienda:/i').first();
+  if (await container.count()) {
+    const near = container.locator('xpath=following::input[1]');
+    if (await near.count() && await near.isVisible()) return near.first();
+  }
+
+  return null;
+}
+
+// Busca el input, rellena RC, selecciona la sugerencia y entra a ficha
 async function searchByRC(target, rc) {
-  const searchBox = target.locator(
-    [
-      'input[placeholder*="Introduzca"][placeholder*="referencia" i]',
-      'input[placeholder*="referencia catastral" i]',
-      'input[aria-label*="Buscar vivienda" i]',
-      'input[placeholder*="Buscar vivienda" i]',
-      'input[type="search"]'
-    ].join(",")
-  ).first();
+  const searchBox = await findRcInput(target);
+  if (!searchBox) return false;
 
-  if (!(await searchBox.count())) return false;
-
-  // limpiar y escribir
   await searchBox.click({ timeout: 2000 }).catch(()=>{});
   await searchBox.fill(" ", { timeout: 1500 }).catch(()=>{});
   await searchBox.fill(rc, { timeout: 2500 }).catch(()=>{});
   await searchBox.press("Enter").catch(()=>{});
 
-  // esperar panel de sugerencias (Material/ARIA)
-  const panel = target.locator(
-    [
-      '[role="listbox"]',
-      '.mat-mdc-autocomplete-panel',
-      'ul[role="listbox"]'
-    ].join(",")
-  ).first();
+  // esperar panel de sugerencias
+  const panel = target.locator('[role="listbox"], .mat-mdc-autocomplete-panel, ul[role="listbox"]').first();
+  await panel.waitFor({ state: "visible", timeout: 5000 }).catch(()=>{});
 
-  await panel.waitFor({ state: "visible", timeout: 4000 }).catch(()=>{});
-
-  // elegir la primera opción válida (evitar “No se han encontrado direcciones”)
-  const options = target.locator(
-    [
-      '[role="listbox"] [role="option"]',
-      '.mat-mdc-autocomplete-panel [role="option"]',
-      'ul[role="listbox"] li'
-    ].join(",")
-  );
-
-  const count = await options.count().catch(()=>0);
-  if (count > 0) {
-    for (let i=0;i<Math.min(count,5);i++){
+  // elegir primera opción válida (evita “No se han encontrado direcciones”)
+  const options = target.locator('[role="listbox"] [role="option"], .mat-mdc-autocomplete-panel [role="option"], ul[role="listbox"] li');
+  const cnt = await options.count().catch(()=>0);
+  if (cnt > 0) {
+    for (let i=0;i<Math.min(cnt,6);i++){
       const opt = options.nth(i);
       const txt = (await opt.innerText().catch(()=>"")) || "";
       if (!/no se han encontrado/i.test(txt)) {
@@ -231,12 +238,11 @@ async function searchByRC(target, rc) {
       }
     }
   } else {
-    // si no hay opciones, reintenta enter
     await searchBox.press("Enter").catch(()=>{});
   }
 
-  // éxito si vemos bloques típicos de la ficha
-  await target.waitForTimeout?.(800).catch(()=>{});
+  // éxito si vemos bloques de ficha
+  await target.waitForTimeout?.(900).catch(()=>{});
   const ficha = target.locator('text=/Datos del catastro|Vivienda\\*|Referencia Catastral\\*|Año de construcción\\*/i').first();
   if (await ficha.count()) return true;
 
@@ -298,13 +304,10 @@ app.post("/", async (req, res) => {
   try {
     const {
       rc,
-      // obligatorios manuales
       etiqueta,   // A..G
       estado,     // nuevo|reformado|bueno|a_reformar (o variantes)
       planta,     // número (Altura)
-      // binarios opcionales
       ascensor, aparcamiento, amueblada, conserjeria, vistas, piscina, zonas,
-      // debug
       debug
     } = req.body || {};
 
@@ -347,12 +350,11 @@ app.post("/", async (req, res) => {
     const work = (async () => {
       const { page, target } = await ensureSerpaviContext(ctx);
 
-      // timeouts por página/frame (ahora sí existe page/target)
       page.setDefaultTimeout(12000);
       page.setDefaultNavigationTimeout(15000);
       target.setDefaultTimeout?.(12000);
 
-      // 1) Buscar por RC en el input grande
+      // 1) Buscar por RC
       const okSearch = await searchByRC(target, String(rc));
       if (!okSearch) {
         const html = await (target.content ? target.content() : page.content()).catch(()=>null);
