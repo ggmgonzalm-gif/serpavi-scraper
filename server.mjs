@@ -97,8 +97,8 @@ function extractRangeAndRef(raw) {
 
   // €/m² si aparece
   let psqm = null;
-  const m2m = t.match(/([\d\.\,]+)\s*€\s*\/\s*m²/i);
-  if (m2m) psqm = eurToNum(m2m[1]);
+  const m2a = t.match(/([\d\.\,]+)\s*€\s*\/\s*m²/i) || t.match(/([\d\.\,]+)\s*€\s*\/\s*m2/i);
+  if (m2a) psqm = eurToNum(m2a[1]);
 
   const out = sanitizeRange({ min, max, precio_ref });
   return { ...out, psqm };
@@ -185,41 +185,64 @@ async function searchByRC(target, rc) {
   const searchBox = target.locator(
     [
       'input[placeholder*="Introduzca"][placeholder*="referencia" i]',
-      'input[placeholder*="referencia" i][placeholder*="catastral" i]',
+      'input[placeholder*="referencia catastral" i]',
       'input[aria-label*="Buscar vivienda" i]',
+      'input[placeholder*="Buscar vivienda" i]',
       'input[type="search"]'
     ].join(",")
   ).first();
 
   if (!(await searchBox.count())) return false;
 
-  await searchBox.fill(" ", { timeout: 2000 }).catch(()=>{});
-  await searchBox.fill(rc, { timeout: 2000 }).catch(()=>{});
+  // limpiar y escribir
+  await searchBox.click({ timeout: 2000 }).catch(()=>{});
+  await searchBox.fill(" ", { timeout: 1500 }).catch(()=>{});
+  await searchBox.fill(rc, { timeout: 2500 }).catch(()=>{});
   await searchBox.press("Enter").catch(()=>{});
 
-  // si hay botón Buscar cercano, probarlo
-  const btnBuscar = target.locator('role=button[name=/Buscar|Consultar|Continuar|Siguiente/i]').first();
-  if (await btnBuscar.count()) { await btnBuscar.click({ timeout: 1500 }).catch(()=>{}); }
+  // esperar panel de sugerencias (Material/ARIA)
+  const panel = target.locator(
+    [
+      '[role="listbox"]',
+      '.mat-mdc-autocomplete-panel',
+      'ul[role="listbox"]'
+    ].join(",")
+  ).first();
 
-  // esperar a que aparezcan resultados o ficha
-  await target.waitForTimeout?.(1200).catch(()=>{});
-  const list = target.locator('[role="listbox"] [role="option"], li[role="option"], ul li').first();
-  if (await list.count()) {
-    await list.click({ timeout: 1500 }).catch(()=>{});
-  }
+  await panel.waitFor({ state: "visible", timeout: 4000 }).catch(()=>{});
 
-  // si tras unos segundos seguimos en home con el input visible, reintenta Enter
-  await target.waitForTimeout?.(1000).catch(()=>{});
-  if (await searchBox.isVisible().catch(()=>false)) {
+  // elegir la primera opción válida (evitar “No se han encontrado direcciones”)
+  const options = target.locator(
+    [
+      '[role="listbox"] [role="option"]',
+      '.mat-mdc-autocomplete-panel [role="option"]',
+      'ul[role="listbox"] li'
+    ].join(",")
+  );
+
+  const count = await options.count().catch(()=>0);
+  if (count > 0) {
+    for (let i=0;i<Math.min(count,5);i++){
+      const opt = options.nth(i);
+      const txt = (await opt.innerText().catch(()=>"")) || "";
+      if (!/no se han encontrado/i.test(txt)) {
+        await opt.click({ timeout: 2000 }).catch(()=>{});
+        break;
+      }
+    }
+  } else {
+    // si no hay opciones, reintenta enter
     await searchBox.press("Enter").catch(()=>{});
   }
 
   // éxito si vemos bloques típicos de la ficha
+  await target.waitForTimeout?.(800).catch(()=>{});
   const ficha = target.locator('text=/Datos del catastro|Vivienda\\*|Referencia Catastral\\*|Año de construcción\\*/i').first();
   if (await ficha.count()) return true;
 
-  // en último término, si desaparece el input, damos por bueno (puede navegar a otra vista)
-  return !(await searchBox.isVisible().catch(()=>false));
+  // si desaparece el input, puede haber navegado a la ficha
+  const stillVisible = await searchBox.isVisible().catch(()=>false);
+  return !stillVisible;
 }
 
 // set de campos manuales
@@ -294,7 +317,14 @@ app.post("/", async (req, res) => {
 
     const browser = await chromium.launch({
       headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox"]
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--no-zygote",
+        "--single-process"
+      ]
     });
 
     const ctx = await browser.newContext({
@@ -316,8 +346,11 @@ app.post("/", async (req, res) => {
 
     const work = (async () => {
       const { page, target } = await ensureSerpaviContext(ctx);
-      page.setDefaultTimeout(15000);
-      target.setDefaultTimeout?.(15000);
+
+      // timeouts por página/frame (ahora sí existe page/target)
+      page.setDefaultTimeout(12000);
+      page.setDefaultNavigationTimeout(15000);
+      target.setDefaultTimeout?.(12000);
 
       // 1) Buscar por RC en el input grande
       const okSearch = await searchByRC(target, String(rc));
@@ -342,8 +375,14 @@ app.post("/", async (req, res) => {
       await setRadioYesNo(target, /(Piscina\s+comunitaria|gimnasio|equipamiento\s+an(á|a)logo)/i, !!piscina);
       await setRadioYesNo(target, /Zonas\s+comunitarias/i, !!zonas);
 
-      // 3) Calcular
-      const btnCalc = target.locator('role=button[name=/Calcular|Consultar|Siguiente|Generar/i], button:has-text("Calcular")').first();
+      // 3) Calcular / Consultar
+      const btnCalc = target.locator(
+        [
+          'role=button[name=/Calcular|Consultar|Siguiente|Generar/i]',
+          'button:has-text("Calcular")',
+          'button:has-text("Consultar")'
+        ].join(",")
+      ).first();
       if (await btnCalc.count()) await btnCalc.click({ timeout: 2000 }).catch(()=>{});
       await target.waitForTimeout?.(2000).catch(()=>{});
       await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(()=>{});
@@ -368,6 +407,7 @@ app.post("/", async (req, res) => {
           if (r.psqm!=null) psqm = r.psqm;
         }
       }
+
       if (min==null && max==null && precio_ref==null) {
         const full = await (target.evaluate ? target.evaluate(()=>document.body.innerText||"") : page.evaluate(()=>document.body.innerText||""));
         const r = extractRangeAndRef(full);
@@ -379,13 +419,13 @@ app.post("/", async (req, res) => {
       }
 
       const out = sanitizeRange({ min, max, precio_ref });
-      const total = out.precio_ref ?? out.max ?? null;
+      const total = out.precio_ref ?? out.max ?? out.min ?? null;
       return { ok:true, min: out.min ?? null, max: out.max ?? null, precio_ref: out.precio_ref ?? null, total, psqm: psqm ?? null, rc, via:"playwright", ms: Date.now()-t0 };
     })();
 
     const result = await Promise.race([
       work,
-      new Promise((_, rej) => setTimeout(() => rej(new Error("TIMEOUT_GLOBAL_65s")), 65000))
+      new Promise((_, rej) => setTimeout(() => rej(new Error("TIMEOUT_GLOBAL_40s")), 40000))
     ]);
 
     if (result && result.ok) return res.json(result);
